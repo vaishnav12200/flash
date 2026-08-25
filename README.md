@@ -4,7 +4,7 @@
 
 Flash is an early-stage terminal emulator project focused on **low input latency**, **fast startup**, **low memory overhead**, and **correct terminal behavior**. It will connect a real user shell to a Linux pseudo-terminal (PTY), interpret ANSI/VT output into a terminal grid, and render that grid through a GPU pipeline.
 
-> **Project status: planning / pre-implementation.** The repository currently contains only the initial Rust crate scaffold. The architecture, roadmap, and feature set below are the agreed target—not functionality that is available today.
+> **Project status: Phase 1 implemented, awaiting review.** Flash currently opens a Wayland window, initializes a GPU surface, and presents a solid GPU-rendered background. PTY, shell, parsing, terminal state, text rendering, and user-facing terminal features remain planned work.
 
 ## Goals
 
@@ -180,7 +180,7 @@ Useful Linux tools include `/usr/bin/time -v`, `hyperfine`, `perf`, flamegraph t
 
 ## Development Status
 
-No application features have been implemented yet. The next step, after design approval, is Phase 0: establish the Rust application foundation, Wayland window, and event-loop structure before introducing GPU, PTY, or terminal-emulation code.
+Phase 1 establishes the native application lifecycle and a resize-safe `wgpu` clear-and-present surface. The next phase, after review approval, is Phase 2: create a PTY, start the user’s shell, log received output bytes, and forward basic keyboard text—without introducing terminal parsing or text rendering yet.
 
 ## References
 

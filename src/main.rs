@@ -1,4 +1,5 @@
 mod app;
+mod renderer;
 
 use app::App;
 use tracing_subscriber::{EnvFilter, fmt};

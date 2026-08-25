@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
@@ -6,16 +8,15 @@ use winit::{
     window::{Window, WindowId},
 };
 
+use crate::renderer::{RenderError, RenderOutcome, Renderer};
+
 const INITIAL_WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize::new(960, 600);
 const WINDOW_TITLE: &str = "Flash";
 
-/// Owns the native window lifecycle for the application.
-///
-/// Terminal state and rendering are intentionally not introduced until later
-/// phases. Keeping this layer limited to platform events gives those systems a
-/// clear integration boundary.
+/// Owns the native window, renderer, and application event lifecycle.
 pub struct App {
-    window: Option<Window>,
+    window: Option<Arc<Window>>,
+    renderer: Option<Renderer>,
     window_size: PhysicalSize<u32>,
     scale_factor: f64,
 }
@@ -24,12 +25,13 @@ impl App {
     pub fn new() -> Self {
         Self {
             window: None,
+            renderer: None,
             window_size: INITIAL_WINDOW_SIZE,
             scale_factor: 1.0,
         }
     }
 
-    fn window(&self) -> Option<&Window> {
+    fn window(&self) -> Option<&Arc<Window>> {
         self.window.as_ref()
     }
 }
@@ -45,25 +47,35 @@ impl ApplicationHandler for App {
             .with_inner_size(INITIAL_WINDOW_SIZE)
             .with_resizable(true);
 
-        match event_loop.create_window(attributes) {
-            Ok(window) => {
-                self.window_size = window.inner_size();
-                self.scale_factor = window.scale_factor();
-                tracing::info!(
-                    width = self.window_size.width,
-                    height = self.window_size.height,
-                    scale_factor = self.scale_factor,
-                    "native window created"
-                );
-
-                window.request_redraw();
-                self.window = Some(window);
-            }
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => Arc::new(window),
             Err(error) => {
                 tracing::error!(%error, "failed to create native window");
                 event_loop.exit();
+                return;
+            }
+        };
+
+        self.window_size = window.inner_size();
+        self.scale_factor = window.scale_factor();
+        tracing::info!(
+            width = self.window_size.width,
+            height = self.window_size.height,
+            scale_factor = self.scale_factor,
+            "native window created"
+        );
+
+        match pollster::block_on(Renderer::new(Arc::clone(&window), self.window_size)) {
+            Ok(renderer) => self.renderer = Some(renderer),
+            Err(error) => {
+                tracing::error!(%error, "failed to initialize GPU renderer");
+                event_loop.exit();
+                return;
             }
         }
+
+        window.request_redraw();
+        self.window = Some(window);
     }
 
     fn window_event(
@@ -72,7 +84,7 @@ impl ApplicationHandler for App {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        if self.window().map(Window::id) != Some(window_id) {
+        if self.window().map(|window| window.id()) != Some(window_id) {
             return;
         }
 
@@ -84,6 +96,10 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 self.window_size = size;
                 tracing::debug!(width = size.width, height = size.height, "window resized");
+
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.resize(size);
+                }
 
                 if size.width > 0 && size.height > 0 {
                     self.window()
@@ -103,16 +119,31 @@ impl ApplicationHandler for App {
                     scale_factor,
                     "window scale factor changed"
                 );
+
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.resize(self.window_size);
+                }
+
                 self.window()
                     .expect("window was validated above")
                     .request_redraw();
             }
             WindowEvent::RedrawRequested => {
-                tracing::trace!(
-                    width = self.window_size.width,
-                    height = self.window_size.height,
-                    "redraw requested"
-                );
+                let Some(renderer) = self.renderer.as_mut() else {
+                    return;
+                };
+
+                match renderer.render() {
+                    Ok(RenderOutcome::Presented) => {}
+                    Ok(RenderOutcome::Reconfigured) => self
+                        .window()
+                        .expect("window was validated above")
+                        .request_redraw(),
+                    Err(RenderError::OutOfMemory) => {
+                        tracing::error!("GPU ran out of memory; exiting");
+                        event_loop.exit();
+                    }
+                }
             }
             _ => {}
         }
