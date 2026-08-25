@@ -2,6 +2,7 @@ mod app;
 mod event;
 mod pty;
 mod renderer;
+mod terminal;
 
 use app::App;
 use event::AppEvent;

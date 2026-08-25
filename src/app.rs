@@ -13,6 +13,7 @@ use crate::{
     event::AppEvent,
     pty::{self, PtyEvent, PtySession},
     renderer::{RenderError, RenderOutcome, Renderer},
+    terminal::Terminal,
 };
 
 const INITIAL_WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize::new(960, 600);
@@ -24,6 +25,7 @@ pub struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     pty: Option<PtySession>,
+    terminal: Terminal,
     window_size: PhysicalSize<u32>,
     scale_factor: f64,
 }
@@ -35,6 +37,7 @@ impl App {
             window: None,
             renderer: None,
             pty: None,
+            terminal: Terminal::new(24, 80),
             window_size: INITIAL_WINDOW_SIZE,
             scale_factor: 1.0,
         }
@@ -48,9 +51,11 @@ impl App {
         let mut received_output = false;
         let mut reader_closed = false;
 
-        if let Some(pty) = self.pty.as_ref() {
+        let (pty, terminal) = (&self.pty, &mut self.terminal);
+        if let Some(pty) = pty.as_ref() {
             pty.drain_events(|event| match event {
                 PtyEvent::Output(bytes) => {
+                    terminal.process_bytes(&bytes);
                     pty::log_output(&bytes);
                     received_output = true;
                 }
