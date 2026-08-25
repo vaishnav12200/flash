@@ -4,7 +4,7 @@
 
 Flash is an early-stage terminal emulator project focused on **low input latency**, **fast startup**, **low memory overhead**, and **correct terminal behavior**. It will connect a real user shell to a Linux pseudo-terminal (PTY), interpret ANSI/VT output into a terminal grid, and render that grid through a GPU pipeline.
 
-> **Project status: Phase 5 implemented, awaiting review.** Flash opens a Wayland/Vulkan window, starts the user’s shell in a PTY, parses common ANSI/VT controls into primary or alternate terminal grids, and GPU-renders printable text, 16/256/RGB colors, backgrounds, inverse text, underlines, and cursor visibility.
+> **Project status: Phase 6 implemented, awaiting review.** Flash dynamically derives its terminal grid from physical window and scaled font metrics, propagates effective row/column changes to the PTY, rebuilds the glyph atlas for Wayland scale changes, and preserves the existing Vulkan/ANSI terminal pipeline.
 
 ## Goals
 
@@ -180,7 +180,7 @@ Useful Linux tools include `/usr/bin/time -v`, `hyperfine`, `perf`, flamegraph t
 
 ## Development Status
 
-Phase 5 adds a `vte` parser adapter, cursor movement and erasing, SGR attributes with 16/256/RGB colors, scrolling regions, insertion/deletion operations, cursor visibility and auto-wrap modes, and primary/alternate screen switching. The next phase, after review approval, is Phase 6: derive terminal rows and columns from pixel/cell geometry, propagate PTY resizes, and handle Wayland scale changes.
+Phase 6 computes rows and columns from padded physical window dimensions and current cell metrics, resizes both terminal screens while preserving overlapping contents, sends effective size changes to the PTY, and rebuilds font metrics and atlas pixels after Wayland scale changes. The next phase, after review approval, is Phase 7: scrollback, selection, clipboard, TOML configuration, configurable shortcuts, and font-size controls.
 
 ## References
 

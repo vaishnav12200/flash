@@ -65,6 +65,12 @@ pub struct Cursor {
     pub column: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GridSize {
+    pub rows: usize,
+    pub columns: usize,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct RenderSnapshot<'a> {
     pub rows: usize,
@@ -90,6 +96,24 @@ impl Screen {
             saved_cursor: Cursor::default(),
             wrap_pending: false,
         }
+    }
+
+    fn resize(&mut self, old_size: GridSize, new_size: GridSize) {
+        let mut cells = vec![Cell::default(); new_size.rows * new_size.columns];
+        let copied_rows = old_size.rows.min(new_size.rows);
+        let copied_columns = old_size.columns.min(new_size.columns);
+        for row in 0..copied_rows {
+            let old_start = row * old_size.columns;
+            let new_start = row * new_size.columns;
+            cells[new_start..new_start + copied_columns]
+                .copy_from_slice(&self.cells[old_start..old_start + copied_columns]);
+        }
+        self.cells = cells;
+        self.cursor.row = self.cursor.row.min(new_size.rows - 1);
+        self.cursor.column = self.cursor.column.min(new_size.columns - 1);
+        self.saved_cursor.row = self.saved_cursor.row.min(new_size.rows - 1);
+        self.saved_cursor.column = self.saved_cursor.column.min(new_size.columns - 1);
+        self.wrap_pending = false;
     }
 }
 
@@ -131,6 +155,26 @@ impl Terminal {
             cursor_visible: true,
             auto_wrap: true,
         }
+    }
+
+    pub fn size(&self) -> GridSize {
+        GridSize {
+            rows: self.rows,
+            columns: self.columns,
+        }
+    }
+
+    pub fn resize(&mut self, size: GridSize) -> bool {
+        if size.rows == 0 || size.columns == 0 || size == self.size() {
+            return false;
+        }
+        let old_size = self.size();
+        self.primary.resize(old_size, size);
+        self.alternate.resize(old_size, size);
+        self.rows = size.rows;
+        self.columns = size.columns;
+        self.reset_scroll_region();
+        true
     }
 
     pub fn print(&mut self, character: char) {
@@ -486,6 +530,25 @@ mod tests {
         terminal.use_alternate_screen(false, false);
         assert_eq!(row_text(&terminal, 0), "p  ");
         assert_eq!(terminal.active().cursor, Cursor { row: 0, column: 1 });
+    }
+
+    #[test]
+    fn resize_preserves_visible_cells_and_clamps_cursor() {
+        let mut terminal = Terminal::new(2, 3);
+        for character in "abcdef".chars() {
+            terminal.print(character);
+        }
+        assert!(terminal.resize(super::GridSize {
+            rows: 3,
+            columns: 2
+        }));
+        assert_eq!(row_text(&terminal, 0), "ab");
+        assert_eq!(row_text(&terminal, 1), "de");
+        assert_eq!(terminal.active().cursor, Cursor { row: 1, column: 1 });
+        assert!(!terminal.resize(super::GridSize {
+            rows: 3,
+            columns: 2
+        }));
     }
 
     #[test]

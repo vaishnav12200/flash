@@ -13,11 +13,29 @@ use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use winit::event_loop::EventLoopProxy;
 
-use crate::event::AppEvent;
+use crate::{event::AppEvent, terminal::GridSize};
 
 const EVENT_QUEUE_CAPACITY: usize = 128;
 const READ_BUFFER_SIZE: usize = 8 * 1024;
 const LOG_PREVIEW_BYTES: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtyDimensions {
+    pub grid: GridSize,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+}
+
+impl PtyDimensions {
+    fn as_pty_size(self) -> PtySize {
+        PtySize {
+            rows: self.grid.rows.min(u16::MAX as usize) as u16,
+            cols: self.grid.columns.min(u16::MAX as usize) as u16,
+            pixel_width: self.pixel_width.min(u16::MAX as u32) as u16,
+            pixel_height: self.pixel_height.min(u16::MAX as u32) as u16,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum PtyEvent {
@@ -40,15 +58,10 @@ pub struct PtySession {
 }
 
 impl PtySession {
-    pub fn spawn(event_proxy: EventLoopProxy<AppEvent>) -> Result<Self> {
+    pub fn spawn(event_proxy: EventLoopProxy<AppEvent>, dimensions: PtyDimensions) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
+            .openpty(dimensions.as_pty_size())
             .context("could not allocate a pseudo-terminal")?;
 
         let reader = pair
@@ -98,6 +111,14 @@ impl PtySession {
             wake_pending,
             reader_thread: Some(reader_thread),
         })
+    }
+
+    pub fn resize(&self, dimensions: PtyDimensions) -> Result<()> {
+        self.master
+            .as_ref()
+            .context("PTY master is closed")?
+            .resize(dimensions.as_pty_size())
+            .context("could not resize PTY")
     }
 
     /// Sends already-encoded terminal input to the shell.
@@ -281,7 +302,8 @@ fn append_truncation_marker(output: &mut String, byte_count: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{escaped_preview, hex_preview};
+    use super::{PtyDimensions, escaped_preview, hex_preview};
+    use crate::terminal::GridSize;
 
     #[test]
     fn escapes_control_bytes_without_losing_printable_text() {
@@ -291,5 +313,22 @@ mod tests {
     #[test]
     fn renders_a_space_separated_hex_preview() {
         assert_eq!(hex_preview(b"A\n\x1b"), "41 0A 1B");
+    }
+
+    #[test]
+    fn pty_dimensions_saturate_to_kernel_field_widths() {
+        let size = PtyDimensions {
+            grid: GridSize {
+                rows: usize::MAX,
+                columns: 80,
+            },
+            pixel_width: u32::MAX,
+            pixel_height: 600,
+        }
+        .as_pty_size();
+        assert_eq!(size.rows, u16::MAX);
+        assert_eq!(size.cols, 80);
+        assert_eq!(size.pixel_width, u16::MAX);
+        assert_eq!(size.pixel_height, 600);
     }
 }

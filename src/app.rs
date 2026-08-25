@@ -11,7 +11,7 @@ use winit::{
 
 use crate::{
     event::AppEvent,
-    pty::{self, PtyEvent, PtySession},
+    pty::{self, PtyDimensions, PtyEvent, PtySession},
     renderer::{RenderError, RenderOutcome, Renderer},
     terminal::{Terminal, TerminalParser},
 };
@@ -47,6 +47,38 @@ impl App {
 
     fn window(&self) -> Option<&Arc<Window>> {
         self.window.as_ref()
+    }
+
+    fn desired_pty_dimensions(&self) -> Option<PtyDimensions> {
+        let renderer = self.renderer.as_ref()?;
+        let content = renderer.content_size(self.window_size);
+        Some(PtyDimensions {
+            grid: renderer.grid_size(self.window_size),
+            pixel_width: content.width,
+            pixel_height: content.height,
+        })
+    }
+
+    fn synchronize_terminal_size(&mut self) {
+        let Some(dimensions) = self.desired_pty_dimensions() else {
+            return;
+        };
+        if !self.terminal.resize(dimensions.grid) {
+            return;
+        }
+
+        tracing::info!(
+            rows = dimensions.grid.rows,
+            columns = dimensions.grid.columns,
+            pixel_width = dimensions.pixel_width,
+            pixel_height = dimensions.pixel_height,
+            "terminal grid resized"
+        );
+        if let Some(pty) = self.pty.as_ref()
+            && let Err(error) = pty.resize(dimensions)
+        {
+            tracing::error!(%error, "failed to propagate terminal size to PTY");
+        }
     }
 
     fn drain_pty_events(&mut self, event_loop: &ActiveEventLoop) {
@@ -142,7 +174,11 @@ impl ApplicationHandler<AppEvent> for App {
             "native window created"
         );
 
-        match pollster::block_on(Renderer::new(Arc::clone(&window), self.window_size)) {
+        match pollster::block_on(Renderer::new(
+            Arc::clone(&window),
+            self.window_size,
+            self.scale_factor,
+        )) {
             Ok(renderer) => self.renderer = Some(renderer),
             Err(error) => {
                 tracing::error!(%error, "failed to initialize GPU renderer");
@@ -151,7 +187,11 @@ impl ApplicationHandler<AppEvent> for App {
             }
         }
 
-        match PtySession::spawn(self.event_proxy.clone()) {
+        self.synchronize_terminal_size();
+        let dimensions = self
+            .desired_pty_dimensions()
+            .expect("renderer was initialized above");
+        match PtySession::spawn(self.event_proxy.clone(), dimensions) {
             Ok(pty) => self.pty = Some(pty),
             Err(error) => {
                 tracing::error!(%error, "failed to initialize PTY session");
@@ -192,6 +232,7 @@ impl ApplicationHandler<AppEvent> for App {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size);
                 }
+                self.synchronize_terminal_size();
 
                 if size.width > 0 && size.height > 0 {
                     self.window()
@@ -213,8 +254,14 @@ impl ApplicationHandler<AppEvent> for App {
                 );
 
                 if let Some(renderer) = self.renderer.as_mut() {
+                    if let Err(error) = renderer.update_scale_factor(scale_factor) {
+                        tracing::error!(%error, "failed to rebuild scaled font atlas");
+                        event_loop.exit();
+                        return;
+                    }
                     renderer.resize(self.window_size);
                 }
+                self.synchronize_terminal_size();
 
                 self.window()
                     .expect("window was validated above")

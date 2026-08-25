@@ -6,7 +6,7 @@ use winit::{dpi::PhysicalSize, window::Window};
 
 use crate::{
     font::{ATLAS_SIZE, FontError, GlyphAtlas},
-    terminal::{Color, RenderSnapshot},
+    terminal::{Color, GridSize, RenderSnapshot},
 };
 
 const CLEAR_COLOR: wgpu::Color = wgpu::Color {
@@ -44,7 +44,7 @@ pub struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     atlas: GlyphAtlas,
-    _atlas_texture: wgpu::Texture,
+    atlas_texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
     viewport_buffer: wgpu::Buffer,
@@ -110,6 +110,7 @@ impl Renderer {
     pub async fn new(
         window: Arc<Window>,
         initial_size: PhysicalSize<u32>,
+        scale_factor: f64,
     ) -> Result<Self, RendererInitError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
@@ -172,7 +173,7 @@ impl Renderer {
             desired_maximum_frame_latency: 2,
         };
 
-        let atlas = GlyphAtlas::load_default().map_err(RendererInitError::Font)?;
+        let atlas = GlyphAtlas::load_default(scale_factor).map_err(RendererInitError::Font)?;
         let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Flash ASCII glyph atlas"),
             size: wgpu::Extent3d {
@@ -323,7 +324,7 @@ impl Renderer {
             queue,
             config,
             atlas,
-            _atlas_texture: atlas_texture,
+            atlas_texture,
             bind_group,
             pipeline,
             viewport_buffer,
@@ -338,6 +339,39 @@ impl Renderer {
 
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
         self.configure(size);
+    }
+
+    pub fn update_scale_factor(&mut self, scale_factor: f64) -> Result<(), FontError> {
+        let atlas = GlyphAtlas::load_default(scale_factor)?;
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.atlas_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &atlas.pixels,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(ATLAS_SIZE),
+                rows_per_image: Some(ATLAS_SIZE),
+            },
+            wgpu::Extent3d {
+                width: ATLAS_SIZE,
+                height: ATLAS_SIZE,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.atlas = atlas;
+        Ok(())
+    }
+
+    pub fn grid_size(&self, size: PhysicalSize<u32>) -> GridSize {
+        grid_size_for_metrics(size, self.atlas.cell_width, self.atlas.cell_height)
+    }
+
+    pub fn content_size(&self, size: PhysicalSize<u32>) -> PhysicalSize<u32> {
+        content_size(size)
     }
 
     pub fn render(&mut self, snapshot: RenderSnapshot<'_>) -> Result<RenderOutcome, RenderError> {
@@ -494,6 +528,21 @@ impl Renderer {
     }
 }
 
+fn content_size(size: PhysicalSize<u32>) -> PhysicalSize<u32> {
+    PhysicalSize::new(
+        size.width.saturating_sub((PADDING_X * 2.0) as u32),
+        size.height.saturating_sub((PADDING_Y * 2.0) as u32),
+    )
+}
+
+fn grid_size_for_metrics(size: PhysicalSize<u32>, cell_width: f32, cell_height: f32) -> GridSize {
+    let content = content_size(size);
+    GridSize {
+        rows: ((content.height as f32 / cell_height).floor() as usize).max(1),
+        columns: ((content.width as f32 / cell_width).floor() as usize).max(1),
+    }
+}
+
 fn resolve_color(color: Color, default: [f32; 4]) -> [f32; 4] {
     match color {
         Color::Default => default,
@@ -556,8 +605,27 @@ fn create_instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffe
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_FOREGROUND, resolve_color, rgba};
-    use crate::terminal::Color;
+    use super::{DEFAULT_FOREGROUND, grid_size_for_metrics, resolve_color, rgba};
+    use crate::terminal::{Color, GridSize};
+    use winit::dpi::PhysicalSize;
+
+    #[test]
+    fn calculates_grid_after_removing_window_padding() {
+        assert_eq!(
+            grid_size_for_metrics(PhysicalSize::new(816, 456), 10.0, 20.0),
+            GridSize {
+                rows: 22,
+                columns: 80
+            }
+        );
+        assert_eq!(
+            grid_size_for_metrics(PhysicalSize::new(1, 1), 10.0, 20.0),
+            GridSize {
+                rows: 1,
+                columns: 1
+            }
+        );
+    }
 
     #[test]
     fn resolves_default_truecolor_and_color_cube_entries() {

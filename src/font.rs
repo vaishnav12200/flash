@@ -4,7 +4,7 @@ use fontdue::{Font, FontSettings};
 
 pub const ATLAS_SIZE: u32 = 1024;
 const FONT_PATH: &str = "/usr/share/fonts/jetbrains-mono-fonts/JetBrainsMono-Regular.otf";
-const FONT_SIZE_PX: f32 = 18.0;
+const BASE_FONT_SIZE_PX: f32 = 18.0;
 const GLYPH_PADDING: u32 = 1;
 
 #[derive(Debug, Clone, Copy)]
@@ -50,13 +50,19 @@ impl fmt::Display for FontError {
 impl Error for FontError {}
 
 impl GlyphAtlas {
-    pub fn load_default() -> Result<Self, FontError> {
+    pub fn load_default(scale_factor: f64) -> Result<Self, FontError> {
+        let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
+            scale_factor.clamp(0.5, 4.0) as f32
+        } else {
+            1.0
+        };
+        let font_size = BASE_FONT_SIZE_PX * scale_factor;
         let bytes = fs::read(Path::new(FONT_PATH)).map_err(FontError::Read)?;
         let font = Font::from_bytes(bytes, FontSettings::default()).map_err(FontError::Parse)?;
         let line_metrics = font
-            .horizontal_line_metrics(FONT_SIZE_PX)
+            .horizontal_line_metrics(font_size)
             .ok_or(FontError::MissingLineMetrics)?;
-        let (reference_metrics, _) = font.rasterize('M', FONT_SIZE_PX);
+        let (reference_metrics, _) = font.rasterize('M', font_size);
         let cell_width = reference_metrics.advance_width.ceil().max(1.0);
         let cell_height = line_metrics.new_line_size.ceil().max(1.0);
         let baseline = line_metrics.ascent.ceil();
@@ -68,7 +74,7 @@ impl GlyphAtlas {
 
         for byte in b' '..=b'~' {
             let character = char::from(byte);
-            let (metrics, bitmap) = font.rasterize(character, FONT_SIZE_PX);
+            let (metrics, bitmap) = font.rasterize(character, font_size);
             if metrics.width == 0 || metrics.height == 0 {
                 glyphs[usize::from(byte)] = Some(GlyphInfo {
                     uv_min: [0.0; 2],
@@ -116,7 +122,7 @@ impl GlyphAtlas {
 
         tracing::info!(
             path = FONT_PATH,
-            font_size = FONT_SIZE_PX,
+            font_size,
             cell_width,
             cell_height,
             "rasterized printable ASCII font atlas"
@@ -194,10 +200,18 @@ mod tests {
 
     #[test]
     fn default_atlas_contains_printable_ascii() {
-        let atlas = GlyphAtlas::load_default().expect("JetBrains Mono must be installed");
+        let atlas = GlyphAtlas::load_default(1.0).expect("JetBrains Mono must be installed");
         assert_eq!(atlas.pixels.len(), (ATLAS_SIZE * ATLAS_SIZE) as usize);
         assert!(atlas.glyph('A').is_some());
         assert!(atlas.glyph('~').is_some());
         assert!(atlas.glyph('é').is_none());
+    }
+
+    #[test]
+    fn scale_factor_changes_physical_cell_metrics() {
+        let normal = GlyphAtlas::load_default(1.0).expect("JetBrains Mono must be installed");
+        let scaled = GlyphAtlas::load_default(2.0).expect("JetBrains Mono must be installed");
+        assert!(scaled.cell_width > normal.cell_width);
+        assert!(scaled.cell_height > normal.cell_height);
     }
 }
