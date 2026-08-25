@@ -13,7 +13,7 @@ use crate::{
     event::AppEvent,
     pty::{self, PtyEvent, PtySession},
     renderer::{RenderError, RenderOutcome, Renderer},
-    terminal::Terminal,
+    terminal::{Terminal, TerminalParser},
 };
 
 const INITIAL_WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize::new(960, 600);
@@ -26,6 +26,7 @@ pub struct App {
     renderer: Option<Renderer>,
     pty: Option<PtySession>,
     terminal: Terminal,
+    terminal_parser: TerminalParser,
     window_size: PhysicalSize<u32>,
     scale_factor: f64,
 }
@@ -38,6 +39,7 @@ impl App {
             renderer: None,
             pty: None,
             terminal: Terminal::new(24, 80),
+            terminal_parser: TerminalParser::default(),
             window_size: INITIAL_WINDOW_SIZE,
             scale_factor: 1.0,
         }
@@ -51,11 +53,11 @@ impl App {
         let mut received_output = false;
         let mut reader_closed = false;
 
-        let (pty, terminal) = (&self.pty, &mut self.terminal);
+        let (pty, terminal, parser) = (&self.pty, &mut self.terminal, &mut self.terminal_parser);
         if let Some(pty) = pty.as_ref() {
             pty.drain_events(|event| match event {
                 PtyEvent::Output(bytes) => {
-                    terminal.process_bytes(&bytes);
+                    parser.process(terminal, &bytes);
                     pty::log_output(&bytes);
                     received_output = true;
                 }
@@ -224,7 +226,7 @@ impl ApplicationHandler<AppEvent> for App {
                     return;
                 };
 
-                match renderer.render() {
+                match renderer.render(self.terminal.render_snapshot()) {
                     Ok(RenderOutcome::Presented) => {}
                     Ok(RenderOutcome::Reconfigured) => self
                         .window()

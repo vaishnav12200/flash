@@ -5,9 +5,12 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+bytemuck = { version = "1", features = ["derive"] }
+fontdue = "0.9"
 pollster = "0.3"
 portable-pty = "0.9.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+vte = "0.15.0"
 wgpu = "0.20"
 winit = { version = "0.30", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen"] }

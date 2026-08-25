@@ -62,9 +62,10 @@ impl PtySession {
 
         let shell = user_shell();
         let mut command = CommandBuilder::new(&shell);
-        // Flash does not yet implement a terminal capability set. Advertising
-        // `dumb` avoids claiming support for control sequences we cannot render.
-        command.env("TERM", "dumb");
+        // Phase 5 implements the common xterm-compatible cursor, screen, mode,
+        // and color sequences needed by shells and mainstream terminal UIs.
+        command.env("TERM", "xterm-256color");
+        command.env("COLORTERM", "truecolor");
         command.env("TERM_PROGRAM", "flash");
 
         let mut child = pair

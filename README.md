@@ -4,7 +4,7 @@
 
 Flash is an early-stage terminal emulator project focused on **low input latency**, **fast startup**, **low memory overhead**, and **correct terminal behavior**. It will connect a real user shell to a Linux pseudo-terminal (PTY), interpret ANSI/VT output into a terminal grid, and render that grid through a GPU pipeline.
 
-> **Project status: Phase 3 implemented, awaiting review.** Flash opens a Wayland window, presents a GPU-rendered background, starts the user’s shell in a PTY, and applies basic shell output to a fixed in-memory terminal grid. Text rendering and ANSI/VT parsing remain planned work.
+> **Project status: Phase 5 implemented, awaiting review.** Flash opens a Wayland/Vulkan window, starts the user’s shell in a PTY, parses common ANSI/VT controls into primary or alternate terminal grids, and GPU-renders printable text, 16/256/RGB colors, backgrounds, inverse text, underlines, and cursor visibility.
 
 ## Goals
 
@@ -180,7 +180,7 @@ Useful Linux tools include `/usr/bin/time -v`, `hyperfine`, `perf`, flamegraph t
 
 ## Development Status
 
-Phase 3 adds a headless, fixed-size terminal grid with compact cells, cursor tracking, printable ASCII, CR/LF/backspace/tab controls, deferred wrapping, and scrolling. The next phase, after review approval, is Phase 4: load a monospace font, construct a glyph atlas, and render the grid and cursor through GPU instancing.
+Phase 5 adds a `vte` parser adapter, cursor movement and erasing, SGR attributes with 16/256/RGB colors, scrolling regions, insertion/deletion operations, cursor visibility and auto-wrap modes, and primary/alternate screen switching. The next phase, after review approval, is Phase 6: derive terminal rows and columns from pixel/cell geometry, propagate PTY resizes, and handle Wayland scale changes.
 
 ## References
 

@@ -1,5 +1,6 @@
 mod app;
 mod event;
+mod font;
 mod pty;
 mod renderer;
 mod terminal;
