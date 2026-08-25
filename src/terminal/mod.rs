@@ -1,5 +1,7 @@
 //! Platform-independent terminal state and ANSI/VT semantic operations.
 
+use std::collections::VecDeque;
+
 mod parser;
 
 pub use parser::TerminalParser;
@@ -71,6 +73,25 @@ pub struct GridSize {
     pub columns: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    pub start: Cursor,
+    pub end: Cursor,
+}
+
+impl Selection {
+    pub fn contains(self, row: usize, column: usize) -> bool {
+        let start = (self.start.row, self.start.column);
+        let end = (self.end.row, self.end.column);
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        (row, column) >= start && (row, column) <= end
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct RenderSnapshot<'a> {
     pub rows: usize,
@@ -78,6 +99,7 @@ pub struct RenderSnapshot<'a> {
     pub cells: &'a [Cell],
     pub cursor: Cursor,
     pub cursor_visible: bool,
+    pub selection: Option<Selection>,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +158,12 @@ pub struct Terminal {
     scroll_bottom: usize,
     cursor_visible: bool,
     auto_wrap: bool,
+    bracketed_paste: bool,
+    history: VecDeque<Vec<Cell>>,
+    history_limit: usize,
+    viewport_offset: usize,
+    viewport_cells: Vec<Cell>,
+    selection: Option<Selection>,
 }
 
 impl Terminal {
@@ -154,6 +182,12 @@ impl Terminal {
             scroll_bottom: rows - 1,
             cursor_visible: true,
             auto_wrap: true,
+            bracketed_paste: false,
+            history: VecDeque::new(),
+            history_limit: 10_000,
+            viewport_offset: 0,
+            viewport_cells: vec![Cell::default(); cell_count],
+            selection: None,
         }
     }
 
@@ -171,10 +205,112 @@ impl Terminal {
         let old_size = self.size();
         self.primary.resize(old_size, size);
         self.alternate.resize(old_size, size);
+        for line in &mut self.history {
+            line.resize(size.columns, Cell::default());
+            line.truncate(size.columns);
+        }
         self.rows = size.rows;
         self.columns = size.columns;
+        self.viewport_cells = vec![Cell::default(); size.rows * size.columns];
+        self.viewport_offset = self.viewport_offset.min(self.history.len());
+        self.selection = None;
         self.reset_scroll_region();
+        self.refresh_viewport();
         true
+    }
+
+    pub fn set_scrollback_limit(&mut self, limit: usize) {
+        self.history_limit = limit;
+        while self.history.len() > limit {
+            self.history.pop_front();
+        }
+        self.viewport_offset = self.viewport_offset.min(self.history.len());
+        self.refresh_viewport();
+    }
+
+    pub fn scroll_viewport(&mut self, lines: isize) {
+        if self.alternate_active || self.history.is_empty() {
+            return;
+        }
+        if lines > 0 {
+            self.viewport_offset = self
+                .viewport_offset
+                .saturating_add(lines as usize)
+                .min(self.history.len());
+        } else {
+            self.viewport_offset = self.viewport_offset.saturating_sub(lines.unsigned_abs());
+        }
+        self.selection = None;
+        self.refresh_viewport();
+    }
+
+    pub fn scroll_page_up(&mut self) {
+        self.scroll_viewport((self.rows.saturating_sub(1)) as isize);
+    }
+    pub fn scroll_page_down(&mut self) {
+        self.scroll_viewport(-((self.rows.saturating_sub(1)) as isize));
+    }
+    pub fn scroll_to_bottom(&mut self) {
+        self.viewport_offset = 0;
+        self.selection = None;
+    }
+
+    pub fn begin_selection(&mut self, cell: Cursor) {
+        let cell = self.clamp_cell(cell);
+        self.selection = Some(Selection {
+            start: cell,
+            end: cell,
+        });
+    }
+
+    pub fn update_selection(&mut self, cell: Cursor) {
+        let cell = self.clamp_cell(cell);
+        if let Some(selection) = self.selection.as_mut() {
+            selection.end = cell;
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        let selection = self.selection?;
+        let cells = self.visible_cells();
+        let (start, end) = if (selection.start.row, selection.start.column)
+            <= (selection.end.row, selection.end.column)
+        {
+            (selection.start, selection.end)
+        } else {
+            (selection.end, selection.start)
+        };
+        let mut output = String::new();
+        for row in start.row..=end.row {
+            let first = if row == start.row { start.column } else { 0 };
+            let last = if row == end.row {
+                end.column
+            } else {
+                self.columns - 1
+            };
+            let line: String = cells[row * self.columns + first..=row * self.columns + last]
+                .iter()
+                .map(|cell| cell.character)
+                .collect();
+            output.push_str(line.trim_end());
+            if row != end.row {
+                output.push('\n');
+            }
+        }
+        Some(output)
+    }
+
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
+    }
+
+    pub(crate) fn finish_output(&mut self) {
+        self.selection = None;
+        self.refresh_viewport();
     }
 
     pub fn print(&mut self, character: char) {
@@ -366,6 +502,9 @@ impl Terminal {
         self.auto_wrap = enabled;
         self.active_mut().wrap_pending = false;
     }
+    pub fn set_bracketed_paste(&mut self, enabled: bool) {
+        self.bracketed_paste = enabled;
+    }
 
     pub fn use_alternate_screen(&mut self, enabled: bool, clear: bool) {
         if enabled == self.alternate_active {
@@ -381,13 +520,17 @@ impl Terminal {
             self.alternate_active = false;
             self.primary.cursor = self.primary.saved_cursor;
         }
+        self.viewport_offset = 0;
+        self.selection = None;
         self.reset_scroll_region();
     }
 
     pub fn reset(&mut self) {
         let rows = self.rows;
         let columns = self.columns;
+        let history_limit = self.history_limit;
         *self = Self::new(rows, columns);
+        self.history_limit = history_limit;
     }
 
     pub fn reset_attributes(&mut self) {
@@ -417,15 +560,32 @@ impl Terminal {
         RenderSnapshot {
             rows: self.rows,
             columns: self.columns,
-            cells: &screen.cells,
+            cells: self.visible_cells(),
             cursor: screen.cursor,
-            cursor_visible: self.cursor_visible,
+            cursor_visible: self.cursor_visible && self.viewport_offset == 0,
+            selection: self.selection,
         }
     }
 
     fn scroll_region_up(&mut self, top: usize, bottom: usize, count: usize) {
         let count = count.min(bottom - top + 1);
         let columns = self.columns;
+        if !self.alternate_active && top == 0 && bottom + 1 == self.rows {
+            for row in 0..count {
+                let start = row * columns;
+                self.history
+                    .push_back(self.primary.cells[start..start + columns].to_vec());
+            }
+            while self.history.len() > self.history_limit {
+                self.history.pop_front();
+            }
+            if self.viewport_offset > 0 {
+                self.viewport_offset = self
+                    .viewport_offset
+                    .saturating_add(count)
+                    .min(self.history.len());
+            }
+        }
         let source = (top + count) * columns..(bottom + 1) * columns;
         self.active_mut().cells.copy_within(source, top * columns);
         let blank = self.blank_cell();
@@ -441,6 +601,41 @@ impl Terminal {
             .copy_within(source, (top + count) * columns);
         let blank = self.blank_cell();
         self.active_mut().cells[top * columns..(top + count) * columns].fill(blank);
+    }
+
+    fn refresh_viewport(&mut self) {
+        if self.viewport_offset == 0 || self.alternate_active {
+            return;
+        }
+        let start_line = self.history.len().saturating_sub(self.viewport_offset);
+        for row in 0..self.rows {
+            let logical_line = start_line + row;
+            let destination = row * self.columns;
+            if logical_line < self.history.len() {
+                self.viewport_cells[destination..destination + self.columns]
+                    .copy_from_slice(&self.history[logical_line]);
+            } else {
+                let screen_row = logical_line - self.history.len();
+                let source = screen_row * self.columns;
+                self.viewport_cells[destination..destination + self.columns]
+                    .copy_from_slice(&self.primary.cells[source..source + self.columns]);
+            }
+        }
+    }
+
+    fn visible_cells(&self) -> &[Cell] {
+        if self.viewport_offset > 0 && !self.alternate_active {
+            &self.viewport_cells
+        } else {
+            &self.active().cells
+        }
+    }
+
+    fn clamp_cell(&self, cell: Cursor) -> Cursor {
+        Cursor {
+            row: cell.row.min(self.rows - 1),
+            column: cell.column.min(self.columns - 1),
+        }
     }
 
     fn blank_cell(&self) -> Cell {
@@ -560,5 +755,70 @@ mod tests {
         let cell = terminal.active().cells[0];
         assert_eq!(cell.foreground, Color::Rgb(1, 2, 3));
         assert_eq!(cell.background, Color::Indexed(4));
+    }
+
+    #[test]
+    fn primary_scrollback_is_bounded_and_excludes_alternate_screen() {
+        let mut terminal = Terminal::new(2, 2);
+        terminal.set_scrollback_limit(2);
+        for character in "aabbccddee".chars() {
+            terminal.print(character);
+        }
+        assert_eq!(terminal.history.len(), 2);
+        assert_eq!(terminal.history[0][0].character, 'b');
+
+        terminal.use_alternate_screen(true, true);
+        for character in "xxyyzz".chars() {
+            terminal.print(character);
+        }
+        assert_eq!(terminal.history.len(), 2);
+    }
+
+    #[test]
+    fn viewport_scrolls_through_history_and_hides_cursor() {
+        let mut terminal = Terminal::new(2, 2);
+        for character in "aabbcc".chars() {
+            terminal.print(character);
+        }
+        terminal.finish_output();
+        terminal.scroll_viewport(1);
+        let snapshot = terminal.render_snapshot();
+        assert_eq!(snapshot.cells[0].character, 'a');
+        assert!(!snapshot.cursor_visible);
+        terminal.scroll_to_bottom();
+        assert!(terminal.render_snapshot().cursor_visible);
+    }
+
+    #[test]
+    fn selection_extracts_multiple_trimmed_rows() {
+        let mut terminal = Terminal::new(2, 4);
+        for character in "abc".chars() {
+            terminal.print(character);
+        }
+        terminal.set_cursor(1, 0);
+        for character in "xy".chars() {
+            terminal.print(character);
+        }
+        terminal.begin_selection(Cursor { row: 0, column: 1 });
+        terminal.update_selection(Cursor { row: 1, column: 2 });
+        assert_eq!(terminal.selected_text().as_deref(), Some("bc\nxy"));
+        terminal.finish_output();
+        assert!(terminal.selected_text().is_none());
+    }
+
+    #[test]
+    fn resize_normalizes_historical_line_widths() {
+        let mut terminal = Terminal::new(2, 3);
+        for character in "aaabbbccc".chars() {
+            terminal.print(character);
+        }
+        terminal.finish_output();
+        terminal.scroll_viewport(1);
+        assert!(terminal.resize(super::GridSize {
+            rows: 2,
+            columns: 2,
+        }));
+        assert_eq!(terminal.render_snapshot().cells.len(), 4);
+        assert!(terminal.history.iter().all(|line| line.len() == 2));
     }
 }

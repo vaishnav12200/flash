@@ -4,7 +4,7 @@
 
 Flash is an early-stage terminal emulator project focused on **low input latency**, **fast startup**, **low memory overhead**, and **correct terminal behavior**. It will connect a real user shell to a Linux pseudo-terminal (PTY), interpret ANSI/VT output into a terminal grid, and render that grid through a GPU pipeline.
 
-> **Project status: Phase 6 implemented, awaiting review.** Flash dynamically derives its terminal grid from physical window and scaled font metrics, propagates effective row/column changes to the PTY, rebuilds the glyph atlas for Wayland scale changes, and preserves the existing Vulkan/ANSI terminal pipeline.
+> **Project status: Phase 7 implemented, awaiting review.** Flash now includes correct PTY key encoding, bounded primary-screen scrollback, mouse selection, Wayland clipboard integration, typed TOML configuration, configurable shortcuts, and runtime font-size controls.
 
 ## Goals
 
@@ -144,13 +144,42 @@ flash/
 
 ## Configuration
 
-Flash will work with defaults when no configuration file exists. Its eventual user configuration location will be:
+Flash works with defaults when no configuration file exists. It reads `$XDG_CONFIG_HOME/flash/config.toml`, falling back to:
 
 ```text
 ~/.config/flash/config.toml
 ```
 
-An initial configuration shape is expected to cover font family and size, window padding/opacity, scrollback limits, cursor behavior, and keyboard shortcuts. Invalid values should be rejected with actionable file and field diagnostics.
+All fields are optional. The current schema and defaults are:
+
+```toml
+[font]
+path = "/usr/share/fonts/jetbrains-mono-fonts/JetBrainsMono-Regular.otf"
+size = 18.0
+
+[window]
+padding_x = 8.0
+padding_y = 8.0
+foreground = "#E6EBF5"
+background = "#090A0E"
+
+[scrollback]
+lines = 10000
+
+[keybindings]
+copy = "Ctrl+Shift+C"
+paste = "Ctrl+Shift+V"
+increase_font = "Ctrl+Shift+Plus"
+decrease_font = "Ctrl+Minus"
+reset_font = "Ctrl+0"
+scroll_page_up = "Shift+PageUp"
+scroll_page_down = "Shift+PageDown"
+scroll_to_bottom = "Ctrl+Shift+End"
+```
+
+Colors use `#RRGGBB`. Font size is restricted to `6..=72`, padding must be non-negative, and scrollback is capped at one million lines. Invalid files produce field-specific diagnostics and Flash safely falls back to defaults for that launch.
+
+Normal terminal input remains distinct from shortcuts: plain `Ctrl+C` sends the PTY interrupt byte, while `Ctrl+Shift+C` copies a selection. Arrow, navigation, editing, Ctrl-letter, and Alt-modified keys are encoded and sent to the PTY rather than moving Flash’s display cursor directly.
 
 ## Compatibility and Security
 
@@ -180,7 +209,7 @@ Useful Linux tools include `/usr/bin/time -v`, `hyperfine`, `perf`, flamegraph t
 
 ## Development Status
 
-Phase 6 computes rows and columns from padded physical window dimensions and current cell metrics, resizes both terminal screens while preserving overlapping contents, sends effective size changes to the PTY, and rebuilds font metrics and atlas pixels after Wayland scale changes. The next phase, after review approval, is Phase 7: scrollback, selection, clipboard, TOML configuration, configurable shortcuts, and font-size controls.
+Phase 7 adds correct PTY input sequences for control and navigation keys; bounded scrollback isolated from the alternate screen; mouse-driven multi-row selection; Wayland copy/paste with bracketed-paste support; XDG TOML configuration; configurable shortcuts; and font-size changes that rebuild glyph metrics, recalculate the grid, resize terminal state, and propagate the new dimensions to the PTY. Phase 8 (Unicode) has not started.
 
 ## References
 

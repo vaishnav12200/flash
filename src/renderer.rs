@@ -1,25 +1,29 @@
-use std::{error::Error, fmt, mem, sync::Arc};
+use std::{error::Error, fmt, mem, path::PathBuf, sync::Arc};
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
-use winit::{dpi::PhysicalSize, window::Window};
+use winit::{
+    dpi::{PhysicalPosition, PhysicalSize},
+    window::Window,
+};
 
 use crate::{
     font::{ATLAS_SIZE, FontError, GlyphAtlas},
-    terminal::{Color, GridSize, RenderSnapshot},
+    terminal::{Color, Cursor, GridSize, RenderSnapshot},
 };
 
-const CLEAR_COLOR: wgpu::Color = wgpu::Color {
-    r: 0.035,
-    g: 0.04,
-    b: 0.055,
-    a: 1.0,
-};
-const DEFAULT_FOREGROUND: [f32; 4] = [0.9, 0.92, 0.96, 1.0];
-const DEFAULT_BACKGROUND: [f32; 4] = [0.035, 0.04, 0.055, 1.0];
 const CURSOR_COLOR: [f32; 4] = [0.55, 0.58, 0.65, 0.65];
-const PADDING_X: f32 = 8.0;
-const PADDING_Y: f32 = 8.0;
+const SELECTION_COLOR: [f32; 4] = [0.25, 0.42, 0.68, 0.72];
+
+#[derive(Debug, Clone)]
+pub struct RendererSettings {
+    pub font_path: PathBuf,
+    pub font_size: f32,
+    pub padding_x: f32,
+    pub padding_y: f32,
+    pub foreground: [f32; 4],
+    pub background: [f32; 4],
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -51,6 +55,8 @@ pub struct Renderer {
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
     instances: Vec<GlyphInstance>,
+    settings: RendererSettings,
+    scale_factor: f64,
 }
 
 #[derive(Debug)]
@@ -111,6 +117,7 @@ impl Renderer {
         window: Arc<Window>,
         initial_size: PhysicalSize<u32>,
         scale_factor: f64,
+        settings: RendererSettings,
     ) -> Result<Self, RendererInitError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
@@ -173,7 +180,8 @@ impl Renderer {
             desired_maximum_frame_latency: 2,
         };
 
-        let atlas = GlyphAtlas::load_default(scale_factor).map_err(RendererInitError::Font)?;
+        let atlas = GlyphAtlas::load(&settings.font_path, settings.font_size, scale_factor)
+            .map_err(RendererInitError::Font)?;
         let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Flash ASCII glyph atlas"),
             size: wgpu::Extent3d {
@@ -331,6 +339,8 @@ impl Renderer {
             instance_buffer,
             instance_capacity,
             instances: Vec::with_capacity(instance_capacity),
+            settings,
+            scale_factor,
         };
         renderer.configure(initial_size);
         tracing::info!(format = ?renderer.config.format, present_mode = ?renderer.config.present_mode, "GPU text renderer initialized");
@@ -342,7 +352,35 @@ impl Renderer {
     }
 
     pub fn update_scale_factor(&mut self, scale_factor: f64) -> Result<(), FontError> {
-        let atlas = GlyphAtlas::load_default(scale_factor)?;
+        let atlas = GlyphAtlas::load(
+            &self.settings.font_path,
+            self.settings.font_size,
+            scale_factor,
+        )?;
+        self.upload_atlas(atlas);
+        self.scale_factor = scale_factor;
+        Ok(())
+    }
+
+    pub fn update_font_size(&mut self, font_size: f32) -> Result<(), FontError> {
+        let atlas = GlyphAtlas::load(&self.settings.font_path, font_size, self.scale_factor)?;
+        self.upload_atlas(atlas);
+        self.settings.font_size = font_size;
+        Ok(())
+    }
+
+    pub fn cell_at(&self, position: PhysicalPosition<f64>, size: GridSize) -> Option<Cursor> {
+        let x = position.x as f32 - self.settings.padding_x;
+        let y = position.y as f32 - self.settings.padding_y;
+        if x < 0.0 || y < 0.0 {
+            return None;
+        }
+        let column = (x / self.atlas.cell_width).floor() as usize;
+        let row = (y / self.atlas.cell_height).floor() as usize;
+        (row < size.rows && column < size.columns).then_some(Cursor { row, column })
+    }
+
+    fn upload_atlas(&mut self, atlas: GlyphAtlas) {
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &self.atlas_texture,
@@ -363,15 +401,20 @@ impl Renderer {
             },
         );
         self.atlas = atlas;
-        Ok(())
     }
 
     pub fn grid_size(&self, size: PhysicalSize<u32>) -> GridSize {
-        grid_size_for_metrics(size, self.atlas.cell_width, self.atlas.cell_height)
+        grid_size_for_metrics(
+            size,
+            self.atlas.cell_width,
+            self.atlas.cell_height,
+            self.settings.padding_x,
+            self.settings.padding_y,
+        )
     }
 
     pub fn content_size(&self, size: PhysicalSize<u32>) -> PhysicalSize<u32> {
-        content_size(size)
+        content_size(size, self.settings.padding_x, self.settings.padding_y)
     }
 
     pub fn render(&mut self, snapshot: RenderSnapshot<'_>) -> Result<RenderOutcome, RenderError> {
@@ -407,7 +450,7 @@ impl Renderer {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(CLEAR_COLOR),
+                        load: wgpu::LoadOp::Clear(wgpu_color(self.settings.background)),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -439,14 +482,33 @@ impl Renderer {
                 if background != Color::Default {
                     self.instances.push(GlyphInstance {
                         position: [
-                            PADDING_X + column as f32 * self.atlas.cell_width,
-                            PADDING_Y + row as f32 * self.atlas.cell_height,
+                            self.settings.padding_x + column as f32 * self.atlas.cell_width,
+                            self.settings.padding_y + row as f32 * self.atlas.cell_height,
                         ],
                         size: [self.atlas.cell_width, self.atlas.cell_height],
                         uv_min: self.atlas.solid_uv_min,
                         uv_max: self.atlas.solid_uv_max,
-                        color: resolve_color(background, DEFAULT_BACKGROUND),
+                        color: resolve_color(background, self.settings.background),
                     });
+                }
+            }
+        }
+
+        if let Some(selection) = snapshot.selection {
+            for row in 0..snapshot.rows {
+                for column in 0..snapshot.columns {
+                    if selection.contains(row, column) {
+                        self.instances.push(GlyphInstance {
+                            position: [
+                                self.settings.padding_x + column as f32 * self.atlas.cell_width,
+                                self.settings.padding_y + row as f32 * self.atlas.cell_height,
+                            ],
+                            size: [self.atlas.cell_width, self.atlas.cell_height],
+                            uv_min: self.atlas.solid_uv_min,
+                            uv_max: self.atlas.solid_uv_max,
+                            color: SELECTION_COLOR,
+                        });
+                    }
                 }
             }
         }
@@ -454,8 +516,8 @@ impl Renderer {
         if snapshot.cursor_visible {
             self.instances.push(GlyphInstance {
                 position: [
-                    PADDING_X + snapshot.cursor.column as f32 * self.atlas.cell_width,
-                    PADDING_Y + snapshot.cursor.row as f32 * self.atlas.cell_height,
+                    self.settings.padding_x + snapshot.cursor.column as f32 * self.atlas.cell_width,
+                    self.settings.padding_y + snapshot.cursor.row as f32 * self.atlas.cell_height,
                 ],
                 size: [self.atlas.cell_width, self.atlas.cell_height],
                 uv_min: self.atlas.solid_uv_min,
@@ -479,25 +541,30 @@ impl Renderer {
                 {
                     self.instances.push(GlyphInstance {
                         position: [
-                            PADDING_X + column as f32 * self.atlas.cell_width + glyph.x_offset,
-                            PADDING_Y + row as f32 * self.atlas.cell_height + glyph.y_offset,
+                            self.settings.padding_x
+                                + column as f32 * self.atlas.cell_width
+                                + glyph.x_offset,
+                            self.settings.padding_y
+                                + row as f32 * self.atlas.cell_height
+                                + glyph.y_offset,
                         ],
                         size: [glyph.width, glyph.height],
                         uv_min: glyph.uv_min,
                         uv_max: glyph.uv_max,
-                        color: resolve_color(foreground, DEFAULT_FOREGROUND),
+                        color: resolve_color(foreground, self.settings.foreground),
                     });
                 }
                 if cell.flags.underline() {
                     self.instances.push(GlyphInstance {
                         position: [
-                            PADDING_X + column as f32 * self.atlas.cell_width,
-                            PADDING_Y + (row + 1) as f32 * self.atlas.cell_height - 2.0,
+                            self.settings.padding_x + column as f32 * self.atlas.cell_width,
+                            self.settings.padding_y + (row + 1) as f32 * self.atlas.cell_height
+                                - 2.0,
                         ],
                         size: [self.atlas.cell_width, 1.0],
                         uv_min: self.atlas.solid_uv_min,
                         uv_max: self.atlas.solid_uv_max,
-                        color: resolve_color(foreground, DEFAULT_FOREGROUND),
+                        color: resolve_color(foreground, self.settings.foreground),
                     });
                 }
             }
@@ -528,15 +595,21 @@ impl Renderer {
     }
 }
 
-fn content_size(size: PhysicalSize<u32>) -> PhysicalSize<u32> {
+fn content_size(size: PhysicalSize<u32>, padding_x: f32, padding_y: f32) -> PhysicalSize<u32> {
     PhysicalSize::new(
-        size.width.saturating_sub((PADDING_X * 2.0) as u32),
-        size.height.saturating_sub((PADDING_Y * 2.0) as u32),
+        size.width.saturating_sub((padding_x * 2.0) as u32),
+        size.height.saturating_sub((padding_y * 2.0) as u32),
     )
 }
 
-fn grid_size_for_metrics(size: PhysicalSize<u32>, cell_width: f32, cell_height: f32) -> GridSize {
-    let content = content_size(size);
+fn grid_size_for_metrics(
+    size: PhysicalSize<u32>,
+    cell_width: f32,
+    cell_height: f32,
+    padding_x: f32,
+    padding_y: f32,
+) -> GridSize {
+    let content = content_size(size, padding_x, padding_y);
     GridSize {
         rows: ((content.height as f32 / cell_height).floor() as usize).max(1),
         columns: ((content.width as f32 / cell_width).floor() as usize).max(1),
@@ -585,6 +658,15 @@ fn resolve_color(color: Color, default: [f32; 4]) -> [f32; 4] {
     }
 }
 
+fn wgpu_color(color: [f32; 4]) -> wgpu::Color {
+    wgpu::Color {
+        r: color[0] as f64,
+        g: color[1] as f64,
+        b: color[2] as f64,
+        a: color[3] as f64,
+    }
+}
+
 fn rgba(red: u8, green: u8, blue: u8) -> [f32; 4] {
     [
         red as f32 / 255.0,
@@ -605,21 +687,21 @@ fn create_instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffe
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_FOREGROUND, grid_size_for_metrics, resolve_color, rgba};
+    use super::{grid_size_for_metrics, resolve_color, rgba};
     use crate::terminal::{Color, GridSize};
     use winit::dpi::PhysicalSize;
 
     #[test]
     fn calculates_grid_after_removing_window_padding() {
         assert_eq!(
-            grid_size_for_metrics(PhysicalSize::new(816, 456), 10.0, 20.0),
+            grid_size_for_metrics(PhysicalSize::new(816, 456), 10.0, 20.0, 8.0, 8.0),
             GridSize {
                 rows: 22,
                 columns: 80
             }
         );
         assert_eq!(
-            grid_size_for_metrics(PhysicalSize::new(1, 1), 10.0, 20.0),
+            grid_size_for_metrics(PhysicalSize::new(1, 1), 10.0, 20.0, 8.0, 8.0),
             GridSize {
                 rows: 1,
                 columns: 1
@@ -629,20 +711,12 @@ mod tests {
 
     #[test]
     fn resolves_default_truecolor_and_color_cube_entries() {
+        const DEFAULT: [f32; 4] = [0.9, 0.92, 0.96, 1.0];
+        assert_eq!(resolve_color(Color::Default, DEFAULT), DEFAULT);
+        assert_eq!(resolve_color(Color::Rgb(1, 2, 3), DEFAULT), rgba(1, 2, 3));
+        assert_eq!(resolve_color(Color::Indexed(16), DEFAULT), rgba(0, 0, 0));
         assert_eq!(
-            resolve_color(Color::Default, DEFAULT_FOREGROUND),
-            DEFAULT_FOREGROUND
-        );
-        assert_eq!(
-            resolve_color(Color::Rgb(1, 2, 3), DEFAULT_FOREGROUND),
-            rgba(1, 2, 3)
-        );
-        assert_eq!(
-            resolve_color(Color::Indexed(16), DEFAULT_FOREGROUND),
-            rgba(0, 0, 0)
-        );
-        assert_eq!(
-            resolve_color(Color::Indexed(231), DEFAULT_FOREGROUND),
+            resolve_color(Color::Indexed(231), DEFAULT),
             rgba(255, 255, 255)
         );
     }

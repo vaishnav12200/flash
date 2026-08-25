@@ -2,22 +2,27 @@ use std::sync::Arc;
 
 use winit::{
     application::ApplicationHandler,
-    dpi::PhysicalSize,
-    event::{ElementState, KeyEvent, WindowEvent},
+    dpi::{PhysicalPosition, PhysicalSize},
+    event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoopProxy},
-    keyboard::{Key, NamedKey},
+    keyboard::ModifiersState,
     window::{Window, WindowId},
 };
 
 use crate::{
+    config::{Config, ShortcutAction, ShortcutMap, parse_color},
     event::AppEvent,
+    input,
     pty::{self, PtyDimensions, PtyEvent, PtySession},
-    renderer::{RenderError, RenderOutcome, Renderer},
+    renderer::{RenderError, RenderOutcome, Renderer, RendererSettings},
     terminal::{Terminal, TerminalParser},
 };
 
 const INITIAL_WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize::new(960, 600);
 const WINDOW_TITLE: &str = "Flash";
+const FONT_SIZE_STEP: f32 = 2.0;
+const MIN_FONT_SIZE: f32 = 6.0;
+const MAX_FONT_SIZE: f32 = 72.0;
 
 /// Owns the native window, renderer, PTY session, and application event lifecycle.
 pub struct App {
@@ -29,19 +34,44 @@ pub struct App {
     terminal_parser: TerminalParser,
     window_size: PhysicalSize<u32>,
     scale_factor: f64,
+    config: Config,
+    shortcuts: ShortcutMap,
+    modifiers: ModifiersState,
+    clipboard: Option<arboard::Clipboard>,
+    cursor_position: PhysicalPosition<f64>,
+    selecting: bool,
+    logical_font_size: f32,
 }
 
 impl App {
-    pub fn new(event_proxy: EventLoopProxy<AppEvent>) -> Self {
+    pub fn new(event_proxy: EventLoopProxy<AppEvent>, config: Config) -> Self {
+        let shortcuts = ShortcutMap::from_config(&config.keybindings)
+            .expect("loaded or default configuration has valid shortcuts");
+        let mut terminal = Terminal::new(24, 80);
+        terminal.set_scrollback_limit(config.scrollback.lines);
+        let clipboard = match arboard::Clipboard::new() {
+            Ok(clipboard) => Some(clipboard),
+            Err(error) => {
+                tracing::warn!(%error, "Wayland clipboard is unavailable");
+                None
+            }
+        };
         Self {
             event_proxy,
             window: None,
             renderer: None,
             pty: None,
-            terminal: Terminal::new(24, 80),
+            terminal,
             terminal_parser: TerminalParser::default(),
             window_size: INITIAL_WINDOW_SIZE,
             scale_factor: 1.0,
+            logical_font_size: config.font.size,
+            config,
+            shortcuts,
+            modifiers: ModifiersState::empty(),
+            clipboard,
+            cursor_position: PhysicalPosition::new(0.0, 0.0),
+            selecting: false,
         }
     }
 
@@ -131,17 +161,104 @@ impl App {
         }
     }
 
-    fn forward_keyboard_input(&mut self, event: KeyEvent) {
-        let Some(bytes) = terminal_input(&event) else {
-            return;
-        };
+    fn write_pty(&mut self, bytes: &[u8]) {
         let Some(pty) = self.pty.as_mut() else {
             return;
         };
-
         if let Err(error) = pty.write(bytes) {
-            tracing::error!(%error, "could not forward keyboard input to PTY");
+            tracing::error!(%error, "could not forward input to PTY");
         }
+    }
+
+    fn forward_keyboard_input(&mut self, event: KeyEvent) {
+        if event.state != ElementState::Pressed {
+            return;
+        }
+        if let Some(action) = self.shortcuts.action(&event.logical_key, self.modifiers) {
+            self.handle_shortcut(action);
+            return;
+        }
+        let Some(bytes) = input::encode_key(&event, self.modifiers) else {
+            return;
+        };
+        self.terminal.scroll_to_bottom();
+        self.write_pty(&bytes);
+    }
+
+    fn handle_shortcut(&mut self, action: ShortcutAction) {
+        match action {
+            ShortcutAction::Copy => self.copy_selection(),
+            ShortcutAction::Paste => self.paste_clipboard(),
+            ShortcutAction::IncreaseFont => {
+                self.change_font_size((self.logical_font_size + FONT_SIZE_STEP).min(MAX_FONT_SIZE))
+            }
+            ShortcutAction::DecreaseFont => {
+                self.change_font_size((self.logical_font_size - FONT_SIZE_STEP).max(MIN_FONT_SIZE))
+            }
+            ShortcutAction::ResetFont => self.change_font_size(self.config.font.size),
+            ShortcutAction::ScrollPageUp => self.terminal.scroll_page_up(),
+            ShortcutAction::ScrollPageDown => self.terminal.scroll_page_down(),
+            ShortcutAction::ScrollToBottom => self.terminal.scroll_to_bottom(),
+        }
+        if let Some(window) = self.window() {
+            window.request_redraw();
+        }
+    }
+
+    fn copy_selection(&mut self) {
+        let Some(text) = self
+            .terminal
+            .selected_text()
+            .filter(|text| !text.is_empty())
+        else {
+            return;
+        };
+        let Some(clipboard) = self.clipboard.as_mut() else {
+            tracing::warn!("cannot copy because the Wayland clipboard is unavailable");
+            return;
+        };
+        if let Err(error) = clipboard.set_text(text) {
+            tracing::error!(%error, "could not copy terminal selection");
+        }
+    }
+
+    fn paste_clipboard(&mut self) {
+        let Some(clipboard) = self.clipboard.as_mut() else {
+            tracing::warn!("cannot paste because the Wayland clipboard is unavailable");
+            return;
+        };
+        let text = match clipboard.get_text() {
+            Ok(text) => text,
+            Err(error) => {
+                tracing::error!(%error, "could not read text from the Wayland clipboard");
+                return;
+            }
+        };
+        self.terminal.scroll_to_bottom();
+        let bytes = input::encode_paste(&text, self.terminal.bracketed_paste());
+        self.write_pty(&bytes);
+    }
+
+    fn change_font_size(&mut self, font_size: f32) {
+        if (font_size - self.logical_font_size).abs() < f32::EPSILON {
+            return;
+        }
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        if let Err(error) = renderer.update_font_size(font_size) {
+            tracing::error!(%error, font_size, "could not rebuild the font atlas");
+            return;
+        }
+        self.logical_font_size = font_size;
+        self.synchronize_terminal_size();
+        tracing::info!(font_size, "terminal font size changed");
+    }
+
+    fn pointer_cell(&self) -> Option<crate::terminal::Cursor> {
+        self.renderer
+            .as_ref()?
+            .cell_at(self.cursor_position, self.terminal.size())
     }
 }
 
@@ -174,10 +291,21 @@ impl ApplicationHandler<AppEvent> for App {
             "native window created"
         );
 
+        let renderer_settings = RendererSettings {
+            font_path: self.config.font.path.clone(),
+            font_size: self.logical_font_size,
+            padding_x: self.config.window.padding_x,
+            padding_y: self.config.window.padding_y,
+            foreground: parse_color(&self.config.window.foreground)
+                .expect("loaded configuration has a valid foreground color"),
+            background: parse_color(&self.config.window.background)
+                .expect("loaded configuration has a valid background color"),
+        };
         match pollster::block_on(Renderer::new(
             Arc::clone(&window),
             self.window_size,
             self.scale_factor,
+            renderer_settings,
         )) {
             Ok(renderer) => self.renderer = Some(renderer),
             Err(error) => {
@@ -267,7 +395,52 @@ impl ApplicationHandler<AppEvent> for App {
                     .expect("window was validated above")
                     .request_redraw();
             }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
+            }
             WindowEvent::KeyboardInput { event, .. } => self.forward_keyboard_input(event),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_position = position;
+                if self.selecting
+                    && let Some(cell) = self.pointer_cell()
+                {
+                    self.terminal.update_selection(cell);
+                    self.window()
+                        .expect("window was validated above")
+                        .request_redraw();
+                }
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => match state {
+                ElementState::Pressed => {
+                    if let Some(cell) = self.pointer_cell() {
+                        self.terminal.begin_selection(cell);
+                        self.selecting = true;
+                    } else {
+                        self.terminal.clear_selection();
+                        self.selecting = false;
+                    }
+                    self.window()
+                        .expect("window was validated above")
+                        .request_redraw();
+                }
+                ElementState::Released => self.selecting = false,
+            },
+            WindowEvent::MouseWheel { delta, .. } => {
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, vertical) => (vertical * 3.0).round() as isize,
+                    MouseScrollDelta::PixelDelta(position) => position.y.signum() as isize * 3,
+                };
+                if lines != 0 {
+                    self.terminal.scroll_viewport(lines);
+                    self.window()
+                        .expect("window was validated above")
+                        .request_redraw();
+                }
+            }
             WindowEvent::RedrawRequested => {
                 let Some(renderer) = self.renderer.as_mut() else {
                     return;
@@ -292,60 +465,5 @@ impl ApplicationHandler<AppEvent> for App {
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.pty.take();
         tracing::info!("Flash is exiting");
-    }
-}
-
-fn terminal_input(event: &KeyEvent) -> Option<&[u8]> {
-    terminal_input_bytes(event.state, &event.logical_key, event.text.as_deref())
-}
-
-fn terminal_input_bytes<'a>(
-    state: ElementState,
-    logical_key: &Key,
-    text: Option<&'a str>,
-) -> Option<&'a [u8]> {
-    if state != ElementState::Pressed {
-        return None;
-    }
-
-    match logical_key {
-        Key::Named(NamedKey::Enter) => Some(b"\r"),
-        Key::Named(NamedKey::Backspace) => Some(b"\x7f"),
-        Key::Named(NamedKey::Tab) => Some(b"\t"),
-        _ => text.map(str::as_bytes),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use winit::{
-        event::ElementState,
-        keyboard::{Key, NamedKey},
-    };
-
-    use super::terminal_input_bytes;
-
-    #[test]
-    fn encodes_text_and_basic_editing_keys() {
-        assert_eq!(
-            terminal_input_bytes(
-                ElementState::Pressed,
-                &Key::Character("a".into()),
-                Some("a")
-            ),
-            Some(&b"a"[..])
-        );
-        assert_eq!(
-            terminal_input_bytes(ElementState::Pressed, &Key::Named(NamedKey::Enter), None),
-            Some(&b"\r"[..])
-        );
-        assert_eq!(
-            terminal_input_bytes(
-                ElementState::Pressed,
-                &Key::Named(NamedKey::Backspace),
-                None
-            ),
-            Some(&b"\x7f"[..])
-        );
     }
 }

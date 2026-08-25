@@ -11,6 +11,7 @@ impl TerminalParser {
     pub fn process(&mut self, terminal: &mut Terminal, bytes: &[u8]) {
         let mut performer = PerformerAdapter { terminal };
         self.parser.advance(&mut performer, bytes);
+        performer.terminal.finish_output();
     }
 }
 
@@ -140,6 +141,7 @@ fn set_private_modes(terminal: &mut Terminal, values: &[u16], enabled: bool) {
                     terminal.restore_cursor();
                 }
             }
+            2004 => terminal.set_bracketed_paste(enabled),
             _ => {}
         }
     }
@@ -229,5 +231,15 @@ mod tests {
         assert!(!terminal.render_snapshot().cursor_visible);
         parser.process(&mut terminal, b"\x1b[?25h");
         assert!(terminal.render_snapshot().cursor_visible);
+    }
+
+    #[test]
+    fn parses_bracketed_paste_mode() {
+        let mut parser = TerminalParser::default();
+        let mut terminal = Terminal::new(1, 1);
+        parser.process(&mut terminal, b"\x1b[?2004h");
+        assert!(terminal.bracketed_paste());
+        parser.process(&mut terminal, b"\x1b[?2004l");
+        assert!(!terminal.bracketed_paste());
     }
 }

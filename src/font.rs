@@ -3,8 +3,9 @@ use std::{error::Error, fmt, fs, path::Path};
 use fontdue::{Font, FontSettings};
 
 pub const ATLAS_SIZE: u32 = 1024;
-const FONT_PATH: &str = "/usr/share/fonts/jetbrains-mono-fonts/JetBrainsMono-Regular.otf";
-const BASE_FONT_SIZE_PX: f32 = 18.0;
+pub const DEFAULT_FONT_PATH: &str =
+    "/usr/share/fonts/jetbrains-mono-fonts/JetBrainsMono-Regular.otf";
+pub const DEFAULT_FONT_SIZE: f32 = 18.0;
 const GLYPH_PADDING: u32 = 1;
 
 #[derive(Debug, Clone, Copy)]
@@ -28,7 +29,10 @@ pub struct GlyphAtlas {
 
 #[derive(Debug)]
 pub enum FontError {
-    Read(std::io::Error),
+    Read {
+        path: std::path::PathBuf,
+        error: std::io::Error,
+    },
     Parse(&'static str),
     MissingLineMetrics,
     AtlasFull,
@@ -37,8 +41,10 @@ pub enum FontError {
 impl fmt::Display for FontError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Read(error) => write!(formatter, "could not read {FONT_PATH}: {error}"),
-            Self::Parse(error) => write!(formatter, "could not parse JetBrains Mono: {error}"),
+            Self::Read { path, error } => {
+                write!(formatter, "could not read {}: {error}", path.display())
+            }
+            Self::Parse(error) => write!(formatter, "could not parse configured font: {error}"),
             Self::MissingLineMetrics => formatter.write_str("font has no horizontal line metrics"),
             Self::AtlasFull => {
                 formatter.write_str("printable ASCII glyphs exceeded the fixed atlas")
@@ -50,14 +56,17 @@ impl fmt::Display for FontError {
 impl Error for FontError {}
 
 impl GlyphAtlas {
-    pub fn load_default(scale_factor: f64) -> Result<Self, FontError> {
+    pub fn load(path: &Path, logical_font_size: f32, scale_factor: f64) -> Result<Self, FontError> {
         let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
             scale_factor.clamp(0.5, 4.0) as f32
         } else {
             1.0
         };
-        let font_size = BASE_FONT_SIZE_PX * scale_factor;
-        let bytes = fs::read(Path::new(FONT_PATH)).map_err(FontError::Read)?;
+        let font_size = logical_font_size * scale_factor;
+        let bytes = fs::read(path).map_err(|error| FontError::Read {
+            path: path.to_path_buf(),
+            error,
+        })?;
         let font = Font::from_bytes(bytes, FontSettings::default()).map_err(FontError::Parse)?;
         let line_metrics = font
             .horizontal_line_metrics(font_size)
@@ -121,7 +130,7 @@ impl GlyphAtlas {
         }
 
         tracing::info!(
-            path = FONT_PATH,
+            path = %path.display(),
             font_size,
             cell_width,
             cell_height,
@@ -136,6 +145,15 @@ impl GlyphAtlas {
             solid_uv_min: [0.5 / ATLAS_SIZE as f32; 2],
             solid_uv_max: [0.5 / ATLAS_SIZE as f32; 2],
         })
+    }
+
+    #[cfg(test)]
+    pub fn load_default(scale_factor: f64) -> Result<Self, FontError> {
+        Self::load(
+            Path::new(DEFAULT_FONT_PATH),
+            DEFAULT_FONT_SIZE,
+            scale_factor,
+        )
     }
 
     pub fn glyph(&self, character: char) -> Option<GlyphInfo> {
