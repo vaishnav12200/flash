@@ -13,6 +13,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use winit::event_loop::{ControlFlow, EventLoop};
 
 fn main() -> Result<(), winit::error::EventLoopError> {
+    let startup_started_at = std::time::Instant::now();
     init_tracing();
 
     let config = match config::Config::load() {
@@ -29,7 +30,7 @@ fn main() -> Result<(), winit::error::EventLoopError> {
     let event_proxy = event_loop.create_proxy();
 
     tracing::info!("starting Flash");
-    event_loop.run_app(&mut App::new(event_proxy, config))
+    event_loop.run_app(&mut App::new(event_proxy, config, startup_started_at))
 }
 
 fn init_tracing() {

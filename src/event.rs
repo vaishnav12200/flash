@@ -2,4 +2,7 @@
 #[derive(Debug, Clone, Copy)]
 pub enum AppEvent {
     PtyActivity,
+    PtyInputReady,
+    FontFallbackReady,
+    InitialFrameDeadline,
 }

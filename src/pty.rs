@@ -4,9 +4,10 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, SyncSender, TryRecvError},
+        mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     },
     thread::{self, JoinHandle},
+    time::Instant,
 };
 
 use anyhow::{Context, Result};
@@ -16,8 +17,12 @@ use winit::event_loop::EventLoopProxy;
 use crate::{event::AppEvent, terminal::GridSize};
 
 const EVENT_QUEUE_CAPACITY: usize = 128;
+const INPUT_QUEUE_CAPACITY: usize = 16;
+pub const INPUT_CHUNK_SIZE: usize = 4 * 1024;
 const READ_BUFFER_SIZE: usize = 8 * 1024;
 const LOG_PREVIEW_BYTES: usize = 256;
+pub const OUTPUT_DRAIN_BYTE_BUDGET: usize = 256 * 1024;
+pub const OUTPUT_DRAIN_TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(6);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PtyDimensions {
@@ -39,22 +44,36 @@ impl PtyDimensions {
 
 #[derive(Debug)]
 pub enum PtyEvent {
-    Output(Vec<u8>),
+    Output { bytes: Vec<u8>, read_at: Instant },
     EndOfFile,
     ReaderError(String),
+    WriterError(String),
+}
+
+pub enum InputEnqueueError {
+    Full(Vec<u8>),
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DrainResult {
+    pub budget_exhausted: bool,
 }
 
 /// A shell process connected through a pseudo-terminal.
 ///
-/// The UI thread owns this object. A single reader thread owns only a cloned
-/// read handle and forwards opaque output byte chunks to the UI thread.
+/// The UI thread owns this object. Dedicated blocking reader and writer
+/// threads exchange bounded byte chunks with the UI event loop.
 pub struct PtySession {
     master: Option<Box<dyn MasterPty + Send>>,
     child: Option<Box<dyn Child + Send + Sync>>,
-    writer: Option<Box<dyn Write + Send>>,
+    input_sender: Option<SyncSender<Vec<u8>>>,
     events: Receiver<PtyEvent>,
     wake_pending: Arc<AtomicBool>,
+    input_wake_pending: Arc<AtomicBool>,
+    event_proxy: EventLoopProxy<AppEvent>,
     reader_thread: Option<JoinHandle<()>>,
+    writer_thread: Option<JoinHandle<()>>,
 }
 
 impl PtySession {
@@ -88,16 +107,51 @@ impl PtySession {
         let process_id = child.process_id();
 
         let (event_sender, events) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+        let (input_sender, input_receiver) = mpsc::sync_channel(INPUT_QUEUE_CAPACITY);
         let wake_pending = Arc::new(AtomicBool::new(false));
         let reader_wake_pending = Arc::clone(&wake_pending);
+        let reader_event_sender = event_sender.clone();
+        let reader_event_proxy = event_proxy.clone();
         let reader_thread = match thread::Builder::new()
             .name("flash-pty-reader".to_owned())
-            .spawn(move || read_pty_output(reader, event_sender, event_proxy, reader_wake_pending))
-        {
+            .spawn(move || {
+                read_pty_output(
+                    reader,
+                    reader_event_sender,
+                    reader_event_proxy,
+                    reader_wake_pending,
+                )
+            }) {
             Ok(reader_thread) => reader_thread,
             Err(error) => {
                 let _ = child.kill();
                 return Err(error).context("could not start PTY reader thread");
+            }
+        };
+
+        let input_wake_pending = Arc::new(AtomicBool::new(false));
+        let writer_input_wake_pending = Arc::clone(&input_wake_pending);
+        let writer_event_proxy = event_proxy.clone();
+        let writer_event_sender = event_sender.clone();
+        let writer_output_wake_pending = Arc::clone(&wake_pending);
+        let writer_thread = match thread::Builder::new()
+            .name("flash-pty-writer".to_owned())
+            .spawn(move || {
+                write_pty_input(
+                    writer,
+                    input_receiver,
+                    writer_event_sender,
+                    writer_event_proxy,
+                    writer_output_wake_pending,
+                    writer_input_wake_pending,
+                )
+            }) {
+            Ok(writer_thread) => writer_thread,
+            Err(error) => {
+                let _ = child.kill();
+                drop(pair.master);
+                let _ = reader_thread.join();
+                return Err(error).context("could not start PTY writer thread");
             }
         };
 
@@ -106,10 +160,13 @@ impl PtySession {
         Ok(Self {
             master: Some(pair.master),
             child: Some(child),
-            writer: Some(writer),
+            input_sender: Some(input_sender),
             events,
             wake_pending,
+            input_wake_pending,
+            event_proxy,
             reader_thread: Some(reader_thread),
+            writer_thread: Some(writer_thread),
         })
     }
 
@@ -121,33 +178,59 @@ impl PtySession {
             .context("could not resize PTY")
     }
 
-    /// Sends already-encoded terminal input to the shell.
-    pub fn write(&mut self, bytes: &[u8]) -> Result<()> {
+    /// Enqueues one bounded input chunk without blocking the UI thread.
+    pub fn try_write(&self, bytes: Vec<u8>) -> std::result::Result<(), InputEnqueueError> {
         if bytes.is_empty() {
             return Ok(());
         }
-
-        let writer = self.writer.as_mut().context("PTY input writer is closed")?;
-        writer
-            .write_all(bytes)
-            .context("could not write keyboard input to PTY")?;
-        writer.flush().context("could not flush PTY input")
+        debug_assert!(bytes.len() <= INPUT_CHUNK_SIZE);
+        let Some(sender) = self.input_sender.as_ref() else {
+            return Err(InputEnqueueError::Closed);
+        };
+        sender.try_send(bytes).map_err(|error| match error {
+            TrySendError::Full(bytes) => InputEnqueueError::Full(bytes),
+            TrySendError::Disconnected(_) => InputEnqueueError::Closed,
+        })
     }
 
-    /// Drains every PTY event currently available without blocking the UI.
+    pub fn acknowledge_input_ready(&self) {
+        self.input_wake_pending.store(false, Ordering::Release);
+    }
+
+    pub fn request_output_wake(&self) {
+        if !self.wake_pending.swap(true, Ordering::AcqRel) {
+            let _ = self.event_proxy.send_event(AppEvent::PtyActivity);
+        }
+    }
+
+    /// Drains PTY events without blocking the UI, yielding after a bounded
+    /// byte or time slice so a redraw can be presented under sustained output.
     ///
     /// The second receive after clearing the wake flag closes the race where a
     /// reader event arrives while the queue is being drained.
-    pub fn drain_events(&self, mut handle: impl FnMut(PtyEvent)) {
+    pub fn drain_events(&self, mut handle: impl FnMut(PtyEvent)) -> DrainResult {
+        let started_at = Instant::now();
+        let mut output_bytes = 0;
         loop {
             while let Ok(event) = self.events.try_recv() {
+                output_bytes += event.output_byte_count();
                 handle(event);
+                if output_bytes >= OUTPUT_DRAIN_BYTE_BUDGET
+                    || started_at.elapsed() >= OUTPUT_DRAIN_TIME_BUDGET
+                {
+                    self.wake_pending.store(false, Ordering::Release);
+                    return DrainResult {
+                        budget_exhausted: true,
+                    };
+                }
             }
 
             self.wake_pending.store(false, Ordering::Release);
             match self.events.try_recv() {
                 Ok(event) => handle(event),
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
+                    return DrainResult::default();
+                }
             }
         }
     }
@@ -167,11 +250,23 @@ impl Drop for PtySession {
             let _ = child.kill();
         }
 
-        self.writer.take();
+        self.input_sender.take();
+        if let Some(writer_thread) = self.writer_thread.take() {
+            let _ = writer_thread.join();
+        }
         self.master.take();
 
         if let Some(reader_thread) = self.reader_thread.take() {
             let _ = reader_thread.join();
+        }
+    }
+}
+
+impl PtyEvent {
+    fn output_byte_count(&self) -> usize {
+        match self {
+            Self::Output { bytes, .. } => bytes.len(),
+            Self::EndOfFile | Self::ReaderError(_) | Self::WriterError(_) => 0,
         }
     }
 }
@@ -204,7 +299,10 @@ fn read_pty_output(
             Ok(byte_count) => {
                 let bytes = buffer[..byte_count].to_vec();
                 if !send_event(
-                    PtyEvent::Output(bytes),
+                    PtyEvent::Output {
+                        bytes,
+                        read_at: Instant::now(),
+                    },
                     &event_sender,
                     &event_proxy,
                     &wake_pending,
@@ -222,6 +320,39 @@ fn read_pty_output(
                 );
                 return;
             }
+        }
+    }
+}
+
+fn write_pty_input(
+    mut writer: Box<dyn Write + Send>,
+    input_receiver: Receiver<Vec<u8>>,
+    event_sender: SyncSender<PtyEvent>,
+    event_proxy: EventLoopProxy<AppEvent>,
+    output_wake_pending: Arc<AtomicBool>,
+    input_wake_pending: Arc<AtomicBool>,
+) {
+    while let Ok(bytes) = input_receiver.recv() {
+        let started_at = Instant::now();
+        let result = writer.write_all(&bytes).and_then(|()| writer.flush());
+        tracing::debug!(
+            byte_count = bytes.len(),
+            write_us = started_at.elapsed().as_micros(),
+            "latency.pty_input_write"
+        );
+        if let Err(error) = result {
+            send_event(
+                PtyEvent::WriterError(error.to_string()),
+                &event_sender,
+                &event_proxy,
+                &output_wake_pending,
+            );
+            return;
+        }
+        if !input_wake_pending.swap(true, Ordering::AcqRel)
+            && event_proxy.send_event(AppEvent::PtyInputReady).is_err()
+        {
+            return;
         }
     }
 }

@@ -491,6 +491,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "unicode-width",
  "vte",
  "wgpu",
  "winit",

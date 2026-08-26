@@ -4,7 +4,7 @@
 
 Flash is an early-stage terminal emulator project focused on **low input latency**, **fast startup**, **low memory overhead**, and **correct terminal behavior**. It will connect a real user shell to a Linux pseudo-terminal (PTY), interpret ANSI/VT output into a terminal grid, and render that grid through a GPU pipeline.
 
-> **Project status: Phase 7 implemented, awaiting review.** Flash now includes correct PTY key encoding, bounded primary-screen scrollback, mouse selection, Wayland clipboard integration, typed TOML configuration, configurable shortcuts, and runtime font-size controls.
+> **Project status: Phase 8 implemented, awaiting review.** Flash now decodes streamed UTF-8, models Unicode cell widths and combining sequences, selects fallback fonts, preserves wide-cell invariants, and applies an explicit monochrome emoji policy.
 
 ## Goals
 
@@ -155,6 +155,7 @@ All fields are optional. The current schema and defaults are:
 ```toml
 [font]
 path = "/usr/share/fonts/jetbrains-mono-fonts/JetBrainsMono-Regular.otf"
+fallback = []
 size = 18.0
 
 [window]
@@ -178,6 +179,8 @@ scroll_to_bottom = "Ctrl+Shift+End"
 ```
 
 Colors use `#RRGGBB`. Font size is restricted to `6..=72`, padding must be non-negative, and scrollback is capped at one million lines. Invalid files produce field-specific diagnostics and Flash safely falls back to defaults for that launch.
+
+`font.fallback` is an optional ordered list of font files. Flash tries the configured primary face first, then configured fallback faces, then a character-specific system face reported by Fontconfig. Missing faces are parsed on a bounded background loader instead of the render thread; a replacement glyph is shown until the requested face is ready. Unicode glyphs are rasterized lazily into a bounded texture atlas.
 
 Normal terminal input remains distinct from shortcuts: plain `Ctrl+C` sends the PTY interrupt byte, while `Ctrl+Shift+C` copies a selection. Arrow, navigation, editing, Ctrl-letter, and Alt-modified keys are encoded and sent to the PTY rather than moving Flash’s display cursor directly.
 
@@ -207,9 +210,17 @@ Flash will track these metrics under documented, repeatable conditions:
 
 Useful Linux tools include `/usr/bin/time -v`, `hyperfine`, `perf`, flamegraph tooling, and `strace`. Comparisons with other terminals will use equivalent window size, font, shell, configuration, and compositor conditions; cold and warm starts will be reported separately.
 
+Set `RUST_LOG=flash=debug` to emit startup, PTY-read-to-UI, parser, PTY-write, font-fallback, redraw-to-present, and render-submit timings. At info level, Flash reports first-window/renderer/PTY/present milestones and one-second PTY-to-present summaries. Startup keeps the Wayland window hidden until a content-bearing frame has been presented when shell output arrives promptly, with a one-shot fallback deadline for silent shells. PTY input uses a bounded asynchronous writer queue, sustained output is parsed in bounded time/byte slices that yield to presentation, and fallback fonts are selected and parsed off the render thread. All three workers block while idle rather than polling.
+
+## Unicode and Emoji Policy
+
+Terminal layout follows Unicode cell-width rules independently of visual glyph metrics. Wide characters own a leading cell plus a protected continuation cell; combining marks remain attached to their base cell; selection and clipboard extraction skip continuation cells while preserving combining sequences. Split UTF-8 sequences from separate PTY reads are retained and decoded correctly.
+
+For v0.1, emoji are rendered as monochrome outline glyphs through the same font atlas as text. Regional-indicator flags, skin-tone modifiers, keycaps, and zero-width-joiner sequences retain one logical cluster span, but Flash does not render color bitmap/COLR emoji or perform discretionary text ligatures. Unsupported glyphs use a replacement glyph rather than changing terminal layout.
+
 ## Development Status
 
-Phase 7 adds correct PTY input sequences for control and navigation keys; bounded scrollback isolated from the alternate screen; mouse-driven multi-row selection; Wayland copy/paste with bracketed-paste support; XDG TOML configuration; configurable shortcuts; and font-size changes that rebuild glyph metrics, recalculate the grid, resize terminal state, and propagate the new dimensions to the PTY. Phase 8 (Unicode) has not started.
+Phase 8 adds streamed UTF-8 decoding tests; Unicode width-aware grid placement; bounded inline combining sequences; ordered primary, configured-fallback, and system-fallback font selection; lazy Unicode glyph caching; correct wide-cell wrapping, erasing, resizing, selection, cursor, decoration, and overwrite behavior; and the documented monochrome emoji policy. A focused post-review latency correction prevents blank startup presentation and event-loop-blocking paste writes while retaining bounded PTY queues. Phase 9 (performance) has not started.
 
 ## References
 

@@ -2,11 +2,14 @@
 
 use std::collections::VecDeque;
 
+use unicode_width::UnicodeWidthChar;
+
 mod parser;
 
 pub use parser::TerminalParser;
 
 const TAB_WIDTH: usize = 8;
+const MAX_COMBINING_CHARACTERS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Color {
@@ -42,9 +45,30 @@ impl CellFlags {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CellWidth {
+    #[default]
+    Single,
+    Wide,
+    Continuation,
+}
+
+impl CellWidth {
+    pub fn columns(self) -> usize {
+        match self {
+            Self::Single => 1,
+            Self::Wide => 2,
+            Self::Continuation => 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cell {
     pub character: char,
+    combining: [char; MAX_COMBINING_CHARACTERS],
+    combining_len: u8,
+    pub width: CellWidth,
     pub foreground: Color,
     pub background: Color,
     pub flags: CellFlags,
@@ -54,9 +78,42 @@ impl Default for Cell {
     fn default() -> Self {
         Self {
             character: ' ',
+            combining: ['\0'; MAX_COMBINING_CHARACTERS],
+            combining_len: 0,
+            width: CellWidth::Single,
             foreground: Color::Default,
             background: Color::Default,
             flags: CellFlags::default(),
+        }
+    }
+}
+
+impl Cell {
+    pub fn characters(&self) -> impl Iterator<Item = char> + '_ {
+        std::iter::once(self.character).chain(
+            self.combining[..usize::from(self.combining_len)]
+                .iter()
+                .copied(),
+        )
+    }
+
+    pub fn is_continuation(&self) -> bool {
+        self.width == CellWidth::Continuation
+    }
+
+    fn append(&mut self, character: char) {
+        let index = usize::from(self.combining_len);
+        if index < self.combining.len() {
+            self.combining[index] = character;
+            self.combining_len += 1;
+        }
+    }
+
+    fn sequence_ends_with(&self, character: char) -> bool {
+        if self.combining_len == 0 {
+            self.character == character
+        } else {
+            self.combining[usize::from(self.combining_len) - 1] == character
         }
     }
 }
@@ -129,6 +186,9 @@ impl Screen {
             let new_start = row * new_size.columns;
             cells[new_start..new_start + copied_columns]
                 .copy_from_slice(&self.cells[old_start..old_start + copied_columns]);
+        }
+        for row in 0..new_size.rows {
+            normalize_row(&mut cells, new_size.columns, row, Cell::default());
         }
         self.cells = cells;
         self.cursor.row = self.cursor.row.min(new_size.rows - 1);
@@ -208,6 +268,7 @@ impl Terminal {
         for line in &mut self.history {
             line.resize(size.columns, Cell::default());
             line.truncate(size.columns);
+            normalize_row(line, size.columns, 0, Cell::default());
         }
         self.rows = size.rows;
         self.columns = size.columns;
@@ -292,10 +353,12 @@ impl Terminal {
             } else {
                 self.columns - 1
             };
-            let line: String = cells[row * self.columns + first..=row * self.columns + last]
-                .iter()
-                .map(|cell| cell.character)
-                .collect();
+            let mut line = String::new();
+            for cell in &cells[row * self.columns + first..=row * self.columns + last] {
+                if !cell.is_continuation() {
+                    line.extend(cell.characters());
+                }
+            }
             output.push_str(line.trim_end());
             if row != end.row {
                 output.push('\n');
@@ -314,23 +377,59 @@ impl Terminal {
     }
 
     pub fn print(&mut self, character: char) {
+        let unicode_width = UnicodeWidthChar::width(character).unwrap_or(0).min(2);
+        if unicode_width == 0 || self.should_join_previous(character) {
+            self.append_to_previous(character);
+            return;
+        }
+
         if self.active().wrap_pending {
             self.line_feed();
             self.carriage_return();
         }
-        let cursor = self.active().cursor;
+
+        let mut width = unicode_width;
+        let mut cursor = self.active().cursor;
+        if width == 2 && cursor.column + 1 >= self.columns {
+            if self.auto_wrap && self.columns > 1 {
+                self.line_feed();
+                self.carriage_return();
+                cursor = self.active().cursor;
+            } else {
+                width = 1;
+            }
+        }
+
+        self.clear_cell_span(cursor.row, cursor.column);
         let index = self.index(cursor.row, cursor.column);
         let attributes = self.attributes;
         self.active_mut().cells[index] = Cell {
             character,
+            width: if width == 2 {
+                CellWidth::Wide
+            } else {
+                CellWidth::Single
+            },
             foreground: attributes.foreground,
             background: attributes.background,
             flags: attributes.flags,
+            ..Cell::default()
         };
-        if cursor.column + 1 == self.columns {
+        if width == 2 {
+            self.active_mut().cells[index + 1] = Cell {
+                width: CellWidth::Continuation,
+                foreground: attributes.foreground,
+                background: attributes.background,
+                flags: attributes.flags,
+                ..Cell::default()
+            };
+        }
+
+        if cursor.column + width >= self.columns {
+            self.active_mut().cursor.column = self.columns - 1;
             self.active_mut().wrap_pending = self.auto_wrap;
         } else {
-            self.active_mut().cursor.column += 1;
+            self.active_mut().cursor.column += width;
         }
     }
 
@@ -413,6 +512,7 @@ impl Terminal {
             2 | 3 => self.active_mut().cells.fill(blank),
             _ => {}
         }
+        self.normalize_active_rows(0, self.rows - 1);
     }
 
     pub fn erase_line(&mut self, mode: u16) {
@@ -426,6 +526,7 @@ impl Terminal {
             2 => self.active_mut().cells[start..end].fill(blank),
             _ => {}
         }
+        self.normalize_active_rows(cursor.row, cursor.row);
     }
 
     pub fn erase_characters(&mut self, count: usize) {
@@ -434,6 +535,7 @@ impl Terminal {
         let end = (start + count).min(self.index(cursor.row, self.columns - 1) + 1);
         let blank = self.blank_cell();
         self.active_mut().cells[start..end].fill(blank);
+        self.normalize_active_rows(cursor.row, cursor.row);
     }
 
     pub fn insert_characters(&mut self, count: usize) {
@@ -446,6 +548,7 @@ impl Terminal {
             .copy_within(start..end - count, start + count);
         let blank = self.blank_cell();
         self.active_mut().cells[start..start + count].fill(blank);
+        self.normalize_active_rows(cursor.row, cursor.row);
     }
 
     pub fn delete_characters(&mut self, count: usize) {
@@ -458,6 +561,7 @@ impl Terminal {
             .copy_within(start + count..end, start);
         let blank = self.blank_cell();
         self.active_mut().cells[end - count..end].fill(blank);
+        self.normalize_active_rows(cursor.row, cursor.row);
     }
 
     pub fn insert_lines(&mut self, count: usize) {
@@ -661,11 +765,142 @@ impl Terminal {
     fn index(&self, row: usize, column: usize) -> usize {
         row * self.columns + column
     }
+
+    fn previous_cell_index(&self) -> Option<usize> {
+        let cursor = self.active().cursor;
+        let column = if self.active().wrap_pending {
+            cursor.column
+        } else {
+            cursor.column.checked_sub(1)?
+        };
+        let mut index = self.index(cursor.row, column);
+        if self.active().cells[index].is_continuation() && column > 0 {
+            index -= 1;
+        }
+        Some(index)
+    }
+
+    fn should_join_previous(&self, character: char) -> bool {
+        let Some(index) = self.previous_cell_index() else {
+            return false;
+        };
+        let previous = &self.active().cells[index];
+        previous.sequence_ends_with('\u{200d}')
+            || is_emoji_modifier(character)
+            || (is_regional_indicator(previous.character)
+                && is_regional_indicator(character)
+                && !previous.combining[..usize::from(previous.combining_len)]
+                    .iter()
+                    .copied()
+                    .any(is_regional_indicator))
+    }
+
+    fn append_to_previous(&mut self, character: char) {
+        if let Some(index) = self.previous_cell_index() {
+            if (is_regional_indicator(character)
+                && is_regional_indicator(self.active().cells[index].character))
+                || character == '\u{20e3}'
+            {
+                self.promote_cell_to_wide(index);
+            }
+            self.active_mut().cells[index].append(character);
+            return;
+        }
+
+        // A leading combining mark has no base. A dotted circle makes the
+        // otherwise invisible sequence inspectable without consuming extra cells.
+        self.print('\u{25cc}');
+        if let Some(index) = self.previous_cell_index() {
+            self.active_mut().cells[index].append(character);
+        }
+    }
+
+    fn promote_cell_to_wide(&mut self, index: usize) {
+        let column = index % self.columns;
+        if self.active().cells[index].width != CellWidth::Single || column + 1 >= self.columns {
+            return;
+        }
+        let attributes = self.active().cells[index];
+        self.clear_cell_span(index / self.columns, column + 1);
+        self.active_mut().cells[index].width = CellWidth::Wide;
+        self.active_mut().cells[index + 1] = Cell {
+            width: CellWidth::Continuation,
+            foreground: attributes.foreground,
+            background: attributes.background,
+            flags: attributes.flags,
+            ..Cell::default()
+        };
+
+        let cursor = self.active().cursor;
+        if cursor.row == index / self.columns && !self.active().wrap_pending {
+            if cursor.column + 1 >= self.columns {
+                self.active_mut().cursor.column = self.columns - 1;
+                self.active_mut().wrap_pending = self.auto_wrap;
+            } else {
+                self.active_mut().cursor.column += 1;
+            }
+        }
+    }
+
+    fn clear_cell_span(&mut self, row: usize, column: usize) {
+        let blank = self.blank_cell();
+        let index = self.index(row, column);
+        match self.active().cells[index].width {
+            CellWidth::Wide => {
+                self.active_mut().cells[index] = blank;
+                if column + 1 < self.columns {
+                    self.active_mut().cells[index + 1] = blank;
+                }
+            }
+            CellWidth::Continuation => {
+                self.active_mut().cells[index] = blank;
+                if column > 0 {
+                    self.active_mut().cells[index - 1] = blank;
+                }
+            }
+            CellWidth::Single => self.active_mut().cells[index] = blank,
+        }
+    }
+
+    fn normalize_active_rows(&mut self, first: usize, last: usize) {
+        let columns = self.columns;
+        let blank = self.blank_cell();
+        let cells = &mut self.active_mut().cells;
+        for row in first..=last {
+            normalize_row(cells, columns, row, blank);
+        }
+    }
+}
+
+fn normalize_row(cells: &mut [Cell], columns: usize, row: usize, blank: Cell) {
+    let start = row * columns;
+    for column in 0..columns {
+        let index = start + column;
+        match cells[index].width {
+            CellWidth::Wide
+                if column + 1 == columns || cells[index + 1].width != CellWidth::Continuation =>
+            {
+                cells[index] = blank;
+            }
+            CellWidth::Continuation if column == 0 || cells[index - 1].width != CellWidth::Wide => {
+                cells[index] = blank;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn is_regional_indicator(character: char) -> bool {
+    ('\u{1f1e6}'..='\u{1f1ff}').contains(&character)
+}
+
+fn is_emoji_modifier(character: char) -> bool {
+    ('\u{1f3fb}'..='\u{1f3ff}').contains(&character)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Color, Cursor, Terminal};
+    use super::{CellWidth, Color, Cursor, Terminal};
 
     fn row_text(terminal: &Terminal, row: usize) -> String {
         let start = terminal.index(row, 0);
@@ -820,5 +1055,64 @@ mod tests {
         }));
         assert_eq!(terminal.render_snapshot().cells.len(), 4);
         assert!(terminal.history.iter().all(|line| line.len() == 2));
+    }
+
+    #[test]
+    fn wide_characters_occupy_two_cells_and_wrap_atomically() {
+        let mut terminal = Terminal::new(2, 3);
+        terminal.print('a');
+        terminal.print('界');
+        assert_eq!(terminal.active().cells[1].width, CellWidth::Wide);
+        assert_eq!(terminal.active().cells[2].width, CellWidth::Continuation);
+        assert_eq!(terminal.active().cursor, Cursor { row: 0, column: 2 });
+
+        terminal.print('語');
+        assert_eq!(terminal.active().cells[3].character, '語');
+        assert_eq!(terminal.active().cells[3].width, CellWidth::Wide);
+        assert_eq!(terminal.active().cells[4].width, CellWidth::Continuation);
+    }
+
+    #[test]
+    fn combining_marks_attach_without_advancing_the_cursor() {
+        let mut terminal = Terminal::new(1, 4);
+        terminal.print('e');
+        terminal.print('\u{301}');
+        assert_eq!(terminal.active().cursor, Cursor { row: 0, column: 1 });
+        assert_eq!(
+            terminal.active().cells[0].characters().collect::<String>(),
+            "e\u{301}"
+        );
+
+        terminal.begin_selection(Cursor { row: 0, column: 0 });
+        assert_eq!(terminal.selected_text().as_deref(), Some("e\u{301}"));
+    }
+
+    #[test]
+    fn overwriting_a_wide_continuation_clears_the_whole_old_glyph() {
+        let mut terminal = Terminal::new(1, 4);
+        terminal.print('界');
+        terminal.set_cursor(0, 1);
+        terminal.print('x');
+        assert_eq!(row_text(&terminal, 0), " x  ");
+        assert_eq!(terminal.active().cells[0].width, CellWidth::Single);
+    }
+
+    #[test]
+    fn emoji_clusters_keep_a_single_logical_cell_span() {
+        let mut terminal = Terminal::new(1, 8);
+        for character in "🇮🇳👩\u{200d}💻".chars() {
+            terminal.print(character);
+        }
+        assert_eq!(terminal.active().cursor.column, 4);
+        assert_eq!(
+            terminal.active().cells[0].characters().collect::<String>(),
+            "🇮🇳"
+        );
+        assert_eq!(
+            terminal.active().cells[2].characters().collect::<String>(),
+            "👩\u{200d}💻"
+        );
+        assert_eq!(terminal.active().cells[1].width, CellWidth::Continuation);
+        assert_eq!(terminal.active().cells[3].width, CellWidth::Continuation);
     }
 }

@@ -242,4 +242,21 @@ mod tests {
         parser.process(&mut terminal, b"\x1b[?2004l");
         assert!(!terminal.bracketed_paste());
     }
+
+    #[test]
+    fn decodes_utf8_sequences_split_across_pty_chunks() {
+        let mut parser = TerminalParser::default();
+        let mut terminal = Terminal::new(1, 6);
+        let bytes = "é界".as_bytes();
+        parser.process(&mut terminal, &bytes[..1]);
+        parser.process(&mut terminal, &bytes[1..4]);
+        parser.process(&mut terminal, &bytes[4..]);
+        let snapshot = terminal.render_snapshot();
+        assert_eq!(snapshot.cells[0].character, 'é');
+        assert_eq!(snapshot.cells[1].character, '界');
+        assert_eq!(
+            snapshot.cells[2].width,
+            crate::terminal::CellWidth::Continuation
+        );
+    }
 }

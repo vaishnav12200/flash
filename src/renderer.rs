@@ -4,10 +4,12 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 use winit::{
     dpi::{PhysicalPosition, PhysicalSize},
+    event_loop::EventLoopProxy,
     window::Window,
 };
 
 use crate::{
+    event::AppEvent,
     font::{ATLAS_SIZE, FontError, GlyphAtlas},
     terminal::{Color, Cursor, GridSize, RenderSnapshot},
 };
@@ -18,6 +20,7 @@ const SELECTION_COLOR: [f32; 4] = [0.25, 0.42, 0.68, 0.72];
 #[derive(Debug, Clone)]
 pub struct RendererSettings {
     pub font_path: PathBuf,
+    pub fallback_font_paths: Vec<PathBuf>,
     pub font_size: f32,
     pub padding_x: f32,
     pub padding_y: f32,
@@ -57,6 +60,7 @@ pub struct Renderer {
     instances: Vec<GlyphInstance>,
     settings: RendererSettings,
     scale_factor: f64,
+    event_proxy: EventLoopProxy<AppEvent>,
 }
 
 #[derive(Debug)]
@@ -117,6 +121,7 @@ impl Renderer {
         window: Arc<Window>,
         initial_size: PhysicalSize<u32>,
         scale_factor: f64,
+        event_proxy: EventLoopProxy<AppEvent>,
         settings: RendererSettings,
     ) -> Result<Self, RendererInitError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -180,8 +185,14 @@ impl Renderer {
             desired_maximum_frame_latency: 2,
         };
 
-        let atlas = GlyphAtlas::load(&settings.font_path, settings.font_size, scale_factor)
-            .map_err(RendererInitError::Font)?;
+        let atlas = GlyphAtlas::load(
+            &settings.font_path,
+            &settings.fallback_font_paths,
+            settings.font_size,
+            scale_factor,
+            Some(event_proxy.clone()),
+        )
+        .map_err(RendererInitError::Font)?;
         let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Flash ASCII glyph atlas"),
             size: wgpu::Extent3d {
@@ -341,6 +352,7 @@ impl Renderer {
             instances: Vec::with_capacity(instance_capacity),
             settings,
             scale_factor,
+            event_proxy,
         };
         renderer.configure(initial_size);
         tracing::info!(format = ?renderer.config.format, present_mode = ?renderer.config.present_mode, "GPU text renderer initialized");
@@ -352,10 +364,15 @@ impl Renderer {
     }
 
     pub fn update_scale_factor(&mut self, scale_factor: f64) -> Result<(), FontError> {
+        if (scale_factor - self.scale_factor).abs() < f64::EPSILON {
+            return Ok(());
+        }
         let atlas = GlyphAtlas::load(
             &self.settings.font_path,
+            &self.settings.fallback_font_paths,
             self.settings.font_size,
             scale_factor,
+            Some(self.event_proxy.clone()),
         )?;
         self.upload_atlas(atlas);
         self.scale_factor = scale_factor;
@@ -363,7 +380,13 @@ impl Renderer {
     }
 
     pub fn update_font_size(&mut self, font_size: f32) -> Result<(), FontError> {
-        let atlas = GlyphAtlas::load(&self.settings.font_path, font_size, self.scale_factor)?;
+        let atlas = GlyphAtlas::load(
+            &self.settings.font_path,
+            &self.settings.fallback_font_paths,
+            font_size,
+            self.scale_factor,
+            Some(self.event_proxy.clone()),
+        )?;
         self.upload_atlas(atlas);
         self.settings.font_size = font_size;
         Ok(())
@@ -418,7 +441,11 @@ impl Renderer {
     }
 
     pub fn render(&mut self, snapshot: RenderSnapshot<'_>) -> Result<RenderOutcome, RenderError> {
+        self.atlas.drain_fallbacks();
         self.build_instances(snapshot);
+        if self.atlas.take_dirty() {
+            self.upload_atlas_pixels();
+        }
         self.ensure_instance_capacity();
         if !self.instances.is_empty() {
             self.queue.write_buffer(
@@ -497,7 +524,15 @@ impl Renderer {
         if let Some(selection) = snapshot.selection {
             for row in 0..snapshot.rows {
                 for column in 0..snapshot.columns {
-                    if selection.contains(row, column) {
+                    let cell = snapshot.cells[row * snapshot.columns + column];
+                    let selected = selection.contains(row, column)
+                        || (cell.is_continuation()
+                            && column > 0
+                            && selection.contains(row, column - 1))
+                        || (cell.width.columns() == 2
+                            && column + 1 < snapshot.columns
+                            && selection.contains(row, column + 1));
+                    if selected {
                         self.instances.push(GlyphInstance {
                             position: [
                                 self.settings.padding_x + column as f32 * self.atlas.cell_width,
@@ -514,12 +549,23 @@ impl Renderer {
         }
 
         if snapshot.cursor_visible {
+            let mut cursor_column = snapshot.cursor.column;
+            let cursor_cell =
+                snapshot.cells[snapshot.cursor.row * snapshot.columns + snapshot.cursor.column];
+            if cursor_cell.is_continuation() && cursor_column > 0 {
+                cursor_column -= 1;
+            }
+            let cursor_width = snapshot.cells
+                [snapshot.cursor.row * snapshot.columns + cursor_column]
+                .width
+                .columns()
+                .max(1) as f32;
             self.instances.push(GlyphInstance {
                 position: [
-                    self.settings.padding_x + snapshot.cursor.column as f32 * self.atlas.cell_width,
+                    self.settings.padding_x + cursor_column as f32 * self.atlas.cell_width,
                     self.settings.padding_y + snapshot.cursor.row as f32 * self.atlas.cell_height,
                 ],
-                size: [self.atlas.cell_width, self.atlas.cell_height],
+                size: [self.atlas.cell_width * cursor_width, self.atlas.cell_height],
                 uv_min: self.atlas.solid_uv_min,
                 uv_max: self.atlas.solid_uv_max,
                 color: CURSOR_COLOR,
@@ -529,39 +575,51 @@ impl Renderer {
         for row in 0..snapshot.rows {
             for column in 0..snapshot.columns {
                 let cell = snapshot.cells[row * snapshot.columns + column];
+                if cell.is_continuation() {
+                    continue;
+                }
                 let foreground = if cell.flags.inverse() {
                     cell.background
                 } else {
                     cell.foreground
                 };
-                if let Some(glyph) = self
-                    .atlas
-                    .glyph(cell.character)
-                    .filter(|glyph| glyph.width > 0.0 && glyph.height > 0.0)
-                {
-                    self.instances.push(GlyphInstance {
-                        position: [
-                            self.settings.padding_x
-                                + column as f32 * self.atlas.cell_width
-                                + glyph.x_offset,
-                            self.settings.padding_y
-                                + row as f32 * self.atlas.cell_height
-                                + glyph.y_offset,
-                        ],
-                        size: [glyph.width, glyph.height],
-                        uv_min: glyph.uv_min,
-                        uv_max: glyph.uv_max,
-                        color: resolve_color(foreground, self.settings.foreground),
-                    });
+                let cell_width = self.atlas.cell_width;
+                let cell_height = self.atlas.cell_height;
+                let occupied_width = cell.width.columns() as f32 * cell_width;
+                for character in cell.characters().filter(|character| {
+                    !matches!(
+                        *character,
+                        '\u{200c}' | '\u{200d}' | '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}'
+                    )
+                }) {
+                    if let Some(glyph) = self
+                        .atlas
+                        .glyph(character)
+                        .filter(|glyph| glyph.width > 0.0 && glyph.height > 0.0)
+                    {
+                        let centered_advance = (occupied_width - glyph.advance_width) * 0.5;
+                        self.instances.push(GlyphInstance {
+                            position: [
+                                self.settings.padding_x
+                                    + column as f32 * cell_width
+                                    + centered_advance
+                                    + glyph.x_offset,
+                                self.settings.padding_y + row as f32 * cell_height + glyph.y_offset,
+                            ],
+                            size: [glyph.width, glyph.height],
+                            uv_min: glyph.uv_min,
+                            uv_max: glyph.uv_max,
+                            color: resolve_color(foreground, self.settings.foreground),
+                        });
+                    }
                 }
                 if cell.flags.underline() {
                     self.instances.push(GlyphInstance {
                         position: [
                             self.settings.padding_x + column as f32 * self.atlas.cell_width,
-                            self.settings.padding_y + (row + 1) as f32 * self.atlas.cell_height
-                                - 2.0,
+                            self.settings.padding_y + (row + 1) as f32 * cell_height - 2.0,
                         ],
-                        size: [self.atlas.cell_width, 1.0],
+                        size: [occupied_width, 1.0],
                         uv_min: self.atlas.solid_uv_min,
                         uv_max: self.atlas.solid_uv_max,
                         color: resolve_color(foreground, self.settings.foreground),
@@ -569,6 +627,28 @@ impl Renderer {
                 }
             }
         }
+    }
+
+    fn upload_atlas_pixels(&self) {
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.atlas_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &self.atlas.pixels,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(ATLAS_SIZE),
+                rows_per_image: Some(ATLAS_SIZE),
+            },
+            wgpu::Extent3d {
+                width: ATLAS_SIZE,
+                height: ATLAS_SIZE,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 
     fn ensure_instance_capacity(&mut self) {

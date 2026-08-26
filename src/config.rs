@@ -19,6 +19,7 @@ pub struct Config {
 #[serde(default)]
 pub struct FontConfig {
     pub path: PathBuf,
+    pub fallback: Vec<PathBuf>,
     pub size: f32,
 }
 
@@ -26,6 +27,7 @@ impl Default for FontConfig {
     fn default() -> Self {
         Self {
             path: PathBuf::from(DEFAULT_FONT_PATH),
+            fallback: Vec::new(),
             size: DEFAULT_FONT_SIZE,
         }
     }
@@ -117,6 +119,14 @@ impl Config {
         }
         if self.font.path.as_os_str().is_empty() {
             bail!("font.path must not be empty");
+        }
+        if self
+            .font
+            .fallback
+            .iter()
+            .any(|path| path.as_os_str().is_empty())
+        {
+            bail!("font.fallback paths must not be empty");
         }
         if !self.window.padding_x.is_finite() || self.window.padding_x < 0.0 {
             bail!("window.padding_x must be non-negative");
@@ -314,6 +324,22 @@ mod tests {
         assert_eq!(config.window.background, "#112233");
         assert_eq!(config.scrollback.lines, 10_000);
         assert_eq!(config.keybindings.copy, "Ctrl+Shift+C");
+    }
+
+    #[test]
+    fn parses_ordered_fallback_font_paths() {
+        let config: Config = toml::from_str(
+            r#"
+                [font]
+                fallback = ["/fonts/cjk.ttf", "/fonts/symbols.otf"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.font.fallback.len(), 2);
+        assert_eq!(
+            config.font.fallback[0],
+            std::path::Path::new("/fonts/cjk.ttf")
+        );
     }
 
     #[test]
