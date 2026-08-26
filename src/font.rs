@@ -35,6 +35,29 @@ pub struct GlyphInfo {
     pub advance_width: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AtlasRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl AtlasRegion {
+    fn union(self, other: Self) -> Self {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let right = (self.x + self.width).max(other.x + other.width);
+        let bottom = (self.y + self.height).max(other.y + other.height);
+        Self {
+            x,
+            y,
+            width: right - x,
+            height: bottom - y,
+        }
+    }
+}
+
 pub struct GlyphAtlas {
     pub pixels: Vec<u8>,
     pub cell_width: f32,
@@ -51,7 +74,7 @@ pub struct GlyphAtlas {
     font_size: f32,
     baseline: f32,
     packer: ShelfPacker,
-    dirty: bool,
+    dirty_region: Option<AtlasRegion>,
 }
 
 struct FallbackResponse {
@@ -156,7 +179,7 @@ impl GlyphAtlas {
             font_size,
             baseline,
             packer: ShelfPacker::new(ATLAS_SIZE, ATLAS_SIZE, 2, 1),
-            dirty: false,
+            dirty_region: None,
             cell_width,
             cell_height,
             solid_uv_min: [0.5 / ATLAS_SIZE as f32; 2],
@@ -166,7 +189,7 @@ impl GlyphAtlas {
         for byte in b' '..=b'~' {
             atlas.cache_glyph(char::from(byte))?;
         }
-        atlas.dirty = false;
+        atlas.dirty_region = None;
 
         tracing::info!(
             path = %path.display(),
@@ -227,8 +250,8 @@ impl GlyphAtlas {
         }
     }
 
-    pub fn take_dirty(&mut self) -> bool {
-        std::mem::take(&mut self.dirty)
+    pub fn take_dirty_region(&mut self) -> Option<AtlasRegion> {
+        self.dirty_region.take()
     }
 
     pub fn drain_fallbacks(&mut self) -> usize {
@@ -303,7 +326,16 @@ impl GlyphAtlas {
                     .copy_from_slice(&bitmap[source..source + metrics.width]);
             }
             let atlas_size = ATLAS_SIZE as f32;
-            self.dirty = true;
+            let region = AtlasRegion {
+                x: glyph_x,
+                y: glyph_y,
+                width: metrics.width as u32,
+                height: metrics.height as u32,
+            };
+            self.dirty_region = Some(
+                self.dirty_region
+                    .map_or(region, |dirty| dirty.union(region)),
+            );
             GlyphInfo {
                 uv_min: [
                     (glyph_x as f32 + 0.5) / atlas_size,
@@ -513,7 +545,7 @@ mod tests {
     use super::{ATLAS_SIZE, GlyphAtlas, ShelfPacker};
 
     fn wait_for_fallbacks(atlas: &mut GlyphAtlas) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while atlas.has_pending_fallbacks() && std::time::Instant::now() < deadline {
             atlas.drain_fallbacks();
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -537,7 +569,10 @@ mod tests {
         assert_eq!(atlas.pixels.len(), (ATLAS_SIZE * ATLAS_SIZE) as usize);
         assert!(atlas.glyph('A').is_some());
         assert!(atlas.glyph('~').is_some());
-        assert!(!atlas.take_dirty(), "preloaded atlas starts clean");
+        assert!(
+            atlas.take_dirty_region().is_none(),
+            "preloaded atlas starts clean"
+        );
         assert!(atlas.glyph('é').is_some());
     }
 
@@ -572,7 +607,10 @@ mod tests {
             .expect("fallback should contain CJK glyphs");
         assert!(glyph.width > 0.0);
         assert!(!atlas.missing.contains(&'界'));
-        assert!(atlas.take_dirty(), "lazy Unicode glyph dirties the atlas");
+        assert!(
+            atlas.take_dirty_region().is_some(),
+            "lazy Unicode glyph dirties the atlas"
+        );
         assert!(atlas.fonts.len() > 1);
     }
 

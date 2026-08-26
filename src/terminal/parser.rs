@@ -9,6 +9,7 @@ pub struct TerminalParser {
 
 impl TerminalParser {
     pub fn process(&mut self, terminal: &mut Terminal, bytes: &[u8]) {
+        terminal.begin_output();
         let mut performer = PerformerAdapter { terminal };
         self.parser.advance(&mut performer, bytes);
         performer.terminal.finish_output();
@@ -21,7 +22,7 @@ struct PerformerAdapter<'a> {
 
 impl Perform for PerformerAdapter<'_> {
     fn print(&mut self, character: char) {
-        self.terminal.print(character);
+        self.terminal.print_output(character);
     }
 
     fn execute(&mut self, byte: u8) {
@@ -38,8 +39,13 @@ impl Perform for PerformerAdapter<'_> {
         if ignore {
             return;
         }
-        let values = parameter_values(params);
-        let first = parameter_or(&values, 0, 1);
+        let mut value_storage = [0_u16; 32];
+        let value_count = params.len().min(value_storage.len());
+        for (destination, subparams) in value_storage.iter_mut().zip(params.iter()) {
+            *destination = subparams.first().copied().unwrap_or(0);
+        }
+        let values = &value_storage[..value_count];
+        let first = parameter_or(values, 0, 1);
         let private = intermediates.contains(&b'?');
 
         match action {
@@ -60,11 +66,11 @@ impl Perform for PerformerAdapter<'_> {
                 first.saturating_sub(1) as usize,
             ),
             'H' | 'f' => self.terminal.set_cursor(
-                parameter_or(&values, 0, 1).saturating_sub(1) as usize,
-                parameter_or(&values, 1, 1).saturating_sub(1) as usize,
+                parameter_or(values, 0, 1).saturating_sub(1) as usize,
+                parameter_or(values, 1, 1).saturating_sub(1) as usize,
             ),
-            'J' => self.terminal.erase_display(parameter_or(&values, 0, 0)),
-            'K' => self.terminal.erase_line(parameter_or(&values, 0, 0)),
+            'J' => self.terminal.erase_display(parameter_or(values, 0, 0)),
+            'K' => self.terminal.erase_line(parameter_or(values, 0, 0)),
             '@' => self.terminal.insert_characters(first as usize),
             'P' => self.terminal.delete_characters(first as usize),
             'X' => self.terminal.erase_characters(first as usize),
@@ -72,23 +78,23 @@ impl Perform for PerformerAdapter<'_> {
             'M' => self.terminal.delete_lines(first as usize),
             'S' => self.terminal.scroll_up(first as usize),
             'T' => self.terminal.scroll_down(first as usize),
-            'm' => apply_sgr(self.terminal, &values),
+            'm' => apply_sgr(self.terminal, values),
             'r' if !private => {
                 if values.is_empty() || values.iter().all(|value| *value == 0) {
                     self.terminal.reset_scroll_region();
                     self.terminal.set_cursor(0, 0);
                 } else {
-                    let top = parameter_or(&values, 0, 1).saturating_sub(1) as usize;
+                    let top = parameter_or(values, 0, 1).saturating_sub(1) as usize;
                     let bottom =
-                        parameter_or(&values, 1, self.terminal.render_snapshot().rows as u16)
+                        parameter_or(values, 1, self.terminal.render_snapshot().rows as u16)
                             .saturating_sub(1) as usize;
                     self.terminal.set_scroll_region(top, bottom);
                 }
             }
             's' => self.terminal.save_cursor(),
             'u' => self.terminal.restore_cursor(),
-            'h' if private => set_private_modes(self.terminal, &values, true),
-            'l' if private => set_private_modes(self.terminal, &values, false),
+            'h' if private => set_private_modes(self.terminal, values, true),
+            'l' if private => set_private_modes(self.terminal, values, false),
             _ => {}
         }
     }
@@ -110,13 +116,6 @@ impl Perform for PerformerAdapter<'_> {
             _ => {}
         }
     }
-}
-
-fn parameter_values(params: &Params) -> Vec<u16> {
-    params
-        .iter()
-        .map(|subparams| subparams.first().copied().unwrap_or(0))
-        .collect()
 }
 
 fn parameter_or(values: &[u16], index: usize, default: u16) -> u16 {

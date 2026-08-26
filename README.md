@@ -4,7 +4,7 @@
 
 Flash is an early-stage terminal emulator project focused on **low input latency**, **fast startup**, **low memory overhead**, and **correct terminal behavior**. It will connect a real user shell to a Linux pseudo-terminal (PTY), interpret ANSI/VT output into a terminal grid, and render that grid through a GPU pipeline.
 
-> **Project status: Phase 8 implemented, awaiting review.** Flash now decodes streamed UTF-8, models Unicode cell widths and combining sequences, selects fallback fonts, preserves wide-cell invariants, and applies an explicit monochrome emoji policy.
+> **Project status: Phase 9 implemented, awaiting review.** Flash now has repeatable parser/allocation benchmarks, measured startup and PTY-to-present diagnostics, batched parsing and input storage, dirty-row renderer caches, partial GPU uploads, and input-to-present latency measurement.
 
 ## Goals
 
@@ -210,7 +210,9 @@ Flash will track these metrics under documented, repeatable conditions:
 
 Useful Linux tools include `/usr/bin/time -v`, `hyperfine`, `perf`, flamegraph tooling, and `strace`. Comparisons with other terminals will use equivalent window size, font, shell, configuration, and compositor conditions; cold and warm starts will be reported separately.
 
-Set `RUST_LOG=flash=debug` to emit startup, PTY-read-to-UI, parser, PTY-write, font-fallback, redraw-to-present, and render-submit timings. At info level, Flash reports first-window/renderer/PTY/present milestones and one-second PTY-to-present summaries. Startup keeps the Wayland window hidden until a content-bearing frame has been presented when shell output arrives promptly, with a one-shot fallback deadline for silent shells. PTY input uses a bounded asynchronous writer queue, sustained output is parsed in bounded time/byte slices that yield to presentation, and fallback fonts are selected and parsed off the render thread. All three workers block while idle rather than polling.
+Set `RUST_LOG=flash=debug` to emit startup, PTY-read-to-UI, parser-batch, PTY-write, font-fallback, dirty-row rebuild, partial atlas upload, partial instance upload, redraw-to-present, and render-submit timings. At info level, Flash reports first-window/renderer/PTY/present milestones, fixed-bucket p50/p95/p99 frame summaries, and one-second PTY-to-present summaries. `FLASH_INPUT_LATENCY_PROBE=1` injects one byte after the first usable frame and reports the resulting input-to-present latency without requiring external input automation. Startup keeps the Wayland window hidden until a content-bearing frame has been presented when shell output arrives promptly, with a one-shot fallback deadline for silent shells. PTY input uses a bounded asynchronous writer queue, sustained output is parsed in bounded time/byte slices that yield to presentation, and fallback fonts are selected and parsed off the render thread. All three workers block while idle rather than polling.
+
+The exact Phase 9 benchmark commands, environment, baseline, and results are recorded in [`PERFORMANCE.md`](PERFORMANCE.md).
 
 ## Unicode and Emoji Policy
 
@@ -220,7 +222,7 @@ For v0.1, emoji are rendered as monochrome outline glyphs through the same font 
 
 ## Development Status
 
-Phase 8 adds streamed UTF-8 decoding tests; Unicode width-aware grid placement; bounded inline combining sequences; ordered primary, configured-fallback, and system-fallback font selection; lazy Unicode glyph caching; correct wide-cell wrapping, erasing, resizing, selection, cursor, decoration, and overwrite behavior; and the documented monochrome emoji policy. A focused post-review latency correction prevents blank startup presentation and event-loop-blocking paste writes while retaining bounded PTY queues. Phase 9 (performance) has not started.
+Phase 9 adds a repeatable allocation-counting throughput benchmark; instrumented startup, PTY, frame-distribution, and input-to-present measurements; allocation-free CSI parameter extraction; reusable scrollback rows; batched PTY parsing; shared backing storage for large paste chunks; terminal row-damage versions; per-row render caches; sparse instance-buffer writes; and dirty-region glyph-atlas uploads. The event loop and worker queues remain blocking and bounded while idle. Phase 9 is complete and awaiting review; no later phase has started.
 
 ## References
 

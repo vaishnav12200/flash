@@ -18,7 +18,7 @@ use crate::{
     config::{Config, ShortcutAction, ShortcutMap, parse_color},
     event::AppEvent,
     input,
-    pty::{self, InputEnqueueError, PtyDimensions, PtyEvent, PtySession},
+    pty::{self, InputEnqueueError, PtyDimensions, PtyEvent, PtyInput, PtySession},
     renderer::{RenderError, RenderOutcome, Renderer, RendererSettings},
     terminal::{Terminal, TerminalParser},
 };
@@ -30,6 +30,24 @@ const MIN_FONT_SIZE: f32 = 6.0;
 const MAX_FONT_SIZE: f32 = 72.0;
 const MAX_PENDING_INPUT_BYTES: usize = 8 * 1024 * 1024;
 const INITIAL_FRAME_DEADLINE: Duration = Duration::from_millis(100);
+const LATENCY_BUCKET_UPPER_US: [u64; 16] = [
+    250,
+    500,
+    750,
+    1_000,
+    1_500,
+    2_000,
+    3_000,
+    4_000,
+    6_000,
+    8_000,
+    12_000,
+    16_000,
+    33_000,
+    100_000,
+    500_000,
+    u64::MAX,
+];
 
 /// Owns the native window, renderer, PTY session, and application event lifecycle.
 pub struct App {
@@ -49,11 +67,36 @@ pub struct App {
     selecting: bool,
     logical_font_size: f32,
     latency: LatencyTracker,
-    pending_input: VecDeque<Vec<u8>>,
+    pending_input: VecDeque<PendingInput>,
     pending_input_bytes: usize,
+    pty_output_batch: Vec<u8>,
     pty_output_deferred: bool,
     window_visible: bool,
     initial_frame_deadline_reached: bool,
+    input_latency_probe_pending: bool,
+}
+
+struct PendingInput {
+    bytes: Arc<[u8]>,
+    offset: usize,
+}
+
+impl PendingInput {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: Arc::from(bytes),
+            offset: 0,
+        }
+    }
+
+    fn remaining_len(&self) -> usize {
+        self.bytes.len() - self.offset
+    }
+
+    fn next_chunk(&self) -> PtyInput {
+        let end = (self.offset + pty::INPUT_CHUNK_SIZE).min(self.bytes.len());
+        PtyInput::new(Arc::clone(&self.bytes), self.offset, end)
+    }
 }
 
 struct LatencyTracker {
@@ -70,6 +113,48 @@ struct LatencyTracker {
     interval_present_count: usize,
     interval_max_reader_to_ui_us: u128,
     interval_max_read_to_present_us: u128,
+    pending_key_to_present_at: Option<Instant>,
+    render_latency: LatencyHistogram,
+    output_latency: LatencyHistogram,
+    key_latency: LatencyHistogram,
+}
+
+#[derive(Default)]
+struct LatencyHistogram {
+    buckets: [u64; LATENCY_BUCKET_UPPER_US.len()],
+    count: u64,
+}
+
+impl LatencyHistogram {
+    fn record(&mut self, latency_us: u128) {
+        let latency_us = latency_us.min(u128::from(u64::MAX)) as u64;
+        let index = LATENCY_BUCKET_UPPER_US
+            .iter()
+            .position(|upper| latency_us <= *upper)
+            .unwrap_or(LATENCY_BUCKET_UPPER_US.len() - 1);
+        self.buckets[index] += 1;
+        self.count += 1;
+    }
+
+    fn percentile_upper_us(&self, percentile: u64) -> u64 {
+        if self.count == 0 {
+            return 0;
+        }
+        let target = self.count.saturating_mul(percentile).div_ceil(100);
+        let mut cumulative = 0;
+        for (count, upper) in self.buckets.iter().zip(LATENCY_BUCKET_UPPER_US) {
+            cumulative += count;
+            if cumulative >= target {
+                return upper;
+            }
+        }
+        u64::MAX
+    }
+
+    fn clear(&mut self) {
+        self.buckets.fill(0);
+        self.count = 0;
+    }
 }
 
 impl LatencyTracker {
@@ -88,6 +173,10 @@ impl LatencyTracker {
             interval_present_count: 0,
             interval_max_reader_to_ui_us: 0,
             interval_max_read_to_present_us: 0,
+            pending_key_to_present_at: None,
+            render_latency: LatencyHistogram::default(),
+            output_latency: LatencyHistogram::default(),
+            key_latency: LatencyHistogram::default(),
         }
     }
 }
@@ -128,9 +217,12 @@ impl App {
             latency: LatencyTracker::new(startup_started_at),
             pending_input: VecDeque::new(),
             pending_input_bytes: 0,
+            pty_output_batch: Vec::with_capacity(pty::OUTPUT_DRAIN_BYTE_BUDGET),
             pty_output_deferred: false,
             window_visible: false,
             initial_frame_deadline_reached: false,
+            input_latency_probe_pending: std::env::var_os("FLASH_INPUT_LATENCY_PROBE")
+                .is_some_and(|value| value == "1"),
         }
     }
 
@@ -180,12 +272,13 @@ impl App {
         let mut received_output = false;
         let mut reader_closed = false;
         let mut writer_failed = false;
+        self.pty_output_batch.clear();
 
-        let (pty, terminal, parser) = (&self.pty, &mut self.terminal, &mut self.terminal_parser);
+        let pty = &self.pty;
         if let Some(pty) = pty.as_ref() {
             let drain_result = pty.drain_events(|event| match event {
                 PtyEvent::Output { bytes, read_at } => {
-                    let process_started_at = Instant::now();
+                    let received_at = Instant::now();
                     if self.latency.first_output_read_at.is_none() {
                         self.latency.first_output_read_at = Some(read_at);
                         tracing::info!(
@@ -202,19 +295,12 @@ impl App {
                     );
                     self.latency.unpresented_output_bytes += bytes.len();
                     self.latency.unpresented_output_chunks += 1;
-                    parser.process(terminal, &bytes);
-                    let reader_to_ui_us = process_started_at.duration_since(read_at).as_micros();
+                    let reader_to_ui_us = received_at.duration_since(read_at).as_micros();
                     self.latency.interval_max_reader_to_ui_us = self
                         .latency
                         .interval_max_reader_to_ui_us
                         .max(reader_to_ui_us);
-                    tracing::debug!(
-                        byte_count = bytes.len(),
-                        reader_to_ui_us,
-                        parse_us = process_started_at.elapsed().as_micros(),
-                        "latency.pty_output_processed"
-                    );
-                    pty::log_output(&bytes);
+                    self.pty_output_batch.extend_from_slice(&bytes);
                     received_output = true;
                 }
                 PtyEvent::EndOfFile => {
@@ -234,6 +320,15 @@ impl App {
         }
 
         if received_output {
+            let process_started_at = Instant::now();
+            self.terminal_parser
+                .process(&mut self.terminal, &self.pty_output_batch);
+            tracing::debug!(
+                byte_count = self.pty_output_batch.len(),
+                parse_us = process_started_at.elapsed().as_micros(),
+                "latency.pty_output_batch_processed"
+            );
+            pty::log_output(&self.pty_output_batch);
             self.latency.output_redraw_requested_at = Some(Instant::now());
             self.window()
                 .expect("window exists while processing PTY events")
@@ -265,7 +360,7 @@ impl App {
         }
     }
 
-    fn write_pty(&mut self, bytes: &[u8]) {
+    fn write_pty(&mut self, bytes: Vec<u8>) {
         if bytes.is_empty() {
             return;
         }
@@ -278,11 +373,12 @@ impl App {
             );
             return;
         }
-        let chunk_count = bytes.len().div_ceil(pty::INPUT_CHUNK_SIZE);
-        append_input_chunks(&mut self.pending_input, bytes);
-        self.pending_input_bytes += bytes.len();
+        let byte_count = bytes.len();
+        let chunk_count = byte_count.div_ceil(pty::INPUT_CHUNK_SIZE);
+        self.pending_input.push_back(PendingInput::new(bytes));
+        self.pending_input_bytes += byte_count;
         tracing::debug!(
-            byte_count = bytes.len(),
+            byte_count,
             chunk_count,
             pending_byte_count = self.pending_input_bytes,
             "latency.pty_input_enqueued"
@@ -294,14 +390,18 @@ impl App {
         let Some(pty) = self.pty.as_ref() else {
             return;
         };
-        while let Some(chunk) = self.pending_input.pop_front() {
+        while let Some(pending) = self.pending_input.front_mut() {
+            let chunk = pending.next_chunk();
             let chunk_len = chunk.len();
             match pty.try_write(chunk) {
-                Ok(()) => self.pending_input_bytes -= chunk_len,
-                Err(InputEnqueueError::Full(chunk)) => {
-                    self.pending_input.push_front(chunk);
-                    break;
+                Ok(()) => {
+                    pending.offset += chunk_len;
+                    self.pending_input_bytes -= chunk_len;
+                    if pending.remaining_len() == 0 {
+                        self.pending_input.pop_front();
+                    }
                 }
+                Err(InputEnqueueError::Full) => break,
                 Err(InputEnqueueError::Closed) => {
                     tracing::error!("could not forward input because the PTY writer is closed");
                     self.pending_input.clear();
@@ -313,6 +413,7 @@ impl App {
     }
 
     fn forward_keyboard_input(&mut self, event: KeyEvent) {
+        let key_received_at = Instant::now();
         if event.state != ElementState::Pressed {
             return;
         }
@@ -323,8 +424,11 @@ impl App {
         let Some(bytes) = input::encode_key(&event, self.modifiers) else {
             return;
         };
+        self.latency
+            .pending_key_to_present_at
+            .get_or_insert(key_received_at);
         self.terminal.scroll_to_bottom();
-        self.write_pty(&bytes);
+        self.write_pty(bytes);
     }
 
     fn handle_shortcut(&mut self, action: ShortcutAction) {
@@ -378,7 +482,7 @@ impl App {
         };
         self.terminal.scroll_to_bottom();
         let bytes = input::encode_paste(&text, self.terminal.bracketed_paste());
-        self.write_pty(&bytes);
+        self.write_pty(bytes);
     }
 
     fn change_font_size(&mut self, font_size: f32) {
@@ -639,6 +743,8 @@ impl ApplicationHandler<AppEvent> for App {
                 match renderer.render(self.terminal.render_snapshot()) {
                     Ok(RenderOutcome::Presented) => {
                         let presented_at = Instant::now();
+                        let render_us = presented_at.duration_since(render_started_at).as_micros();
+                        self.latency.render_latency.record(render_us);
                         if !self.latency.first_present_complete {
                             tracing::info!(
                                 startup_to_first_present_us = presented_at
@@ -646,8 +752,7 @@ impl ApplicationHandler<AppEvent> for App {
                                     .as_micros(),
                                 first_frame_had_pty_output =
                                     self.latency.first_output_read_at.is_some(),
-                                render_us =
-                                    presented_at.duration_since(render_started_at).as_micros(),
+                                render_us,
                                 "latency.first_present"
                             );
                             self.latency.first_present_complete = true;
@@ -655,6 +760,7 @@ impl ApplicationHandler<AppEvent> for App {
                         if let Some(read_at) = self.latency.oldest_unpresented_output_at.take() {
                             let read_to_present_us =
                                 presented_at.duration_since(read_at).as_micros();
+                            self.latency.output_latency.record(read_to_present_us);
                             if !self.latency.first_output_present_complete {
                                 tracing::info!(
                                     byte_count = self.latency.unpresented_output_bytes,
@@ -675,8 +781,7 @@ impl ApplicationHandler<AppEvent> for App {
                                     self.latency.output_redraw_requested_at.map(|requested_at| {
                                         presented_at.duration_since(requested_at).as_micros()
                                     }),
-                                render_us =
-                                    presented_at.duration_since(render_started_at).as_micros(),
+                                render_us,
                                 "latency.pty_output_presented"
                             );
                             self.latency.interval_output_bytes +=
@@ -689,6 +794,12 @@ impl ApplicationHandler<AppEvent> for App {
                             self.latency.unpresented_output_bytes = 0;
                             self.latency.unpresented_output_chunks = 0;
                             self.latency.output_redraw_requested_at = None;
+                            if let Some(key_at) = self.latency.pending_key_to_present_at.take() {
+                                let key_to_present_us =
+                                    presented_at.duration_since(key_at).as_micros();
+                                self.latency.key_latency.record(key_to_present_us);
+                                tracing::info!(key_to_present_us, "latency.key_to_present");
+                            }
                         }
                         if self.latency.interval_started_at.elapsed() >= Duration::from_secs(1) {
                             tracing::info!(
@@ -699,6 +810,15 @@ impl ApplicationHandler<AppEvent> for App {
                                 max_reader_to_ui_us = self.latency.interval_max_reader_to_ui_us,
                                 max_read_to_present_us =
                                     self.latency.interval_max_read_to_present_us,
+                                render_p50_upper_us =
+                                    self.latency.render_latency.percentile_upper_us(50),
+                                render_p95_upper_us =
+                                    self.latency.render_latency.percentile_upper_us(95),
+                                render_p99_upper_us =
+                                    self.latency.render_latency.percentile_upper_us(99),
+                                output_p95_upper_us =
+                                    self.latency.output_latency.percentile_upper_us(95),
+                                key_p95_upper_us = self.latency.key_latency.percentile_upper_us(95),
                                 "latency.pty_present_interval"
                             );
                             self.latency.interval_started_at = presented_at;
@@ -706,6 +826,9 @@ impl ApplicationHandler<AppEvent> for App {
                             self.latency.interval_present_count = 0;
                             self.latency.interval_max_reader_to_ui_us = 0;
                             self.latency.interval_max_read_to_present_us = 0;
+                            self.latency.render_latency.clear();
+                            self.latency.output_latency.clear();
+                            self.latency.key_latency.clear();
                         }
                         if !self.window_visible {
                             self.window()
@@ -718,6 +841,12 @@ impl ApplicationHandler<AppEvent> for App {
                             if let Some(pty) = self.pty.as_ref() {
                                 pty.request_output_wake();
                             }
+                        }
+                        if self.input_latency_probe_pending {
+                            self.input_latency_probe_pending = false;
+                            self.latency.pending_key_to_present_at = Some(Instant::now());
+                            tracing::info!("latency.input_probe_started");
+                            self.write_pty(vec![b'x']);
                         }
                     }
                     Ok(RenderOutcome::Reconfigured) => self
@@ -740,43 +869,41 @@ impl ApplicationHandler<AppEvent> for App {
     }
 }
 
-fn append_input_chunks(queue: &mut VecDeque<Vec<u8>>, bytes: &[u8]) {
-    queue.extend(bytes.chunks(pty::INPUT_CHUNK_SIZE).map(<[u8]>::to_vec));
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, sync::mpsc, time::Instant};
+    use std::{sync::Arc, time::Instant};
 
-    use super::append_input_chunks;
+    use super::{LatencyHistogram, PendingInput};
     use crate::pty::INPUT_CHUNK_SIZE;
 
     #[test]
     fn large_input_hits_bounded_channel_backpressure_without_blocking() {
         let bytes = vec![b'x'; 8 * 1024 * 1024];
         let started_at = Instant::now();
-        let mut pending = VecDeque::new();
-        append_input_chunks(&mut pending, &bytes);
-
-        let (sender, _receiver) = mpsc::sync_channel(16);
-        let mut accepted = 0;
-        while let Some(chunk) = pending.pop_front() {
-            match sender.try_send(chunk) {
-                Ok(()) => accepted += 1,
-                Err(mpsc::TrySendError::Full(chunk)) => {
-                    pending.push_front(chunk);
-                    break;
-                }
-                Err(mpsc::TrySendError::Disconnected(_)) => unreachable!(),
-            }
+        let mut pending = PendingInput::new(bytes);
+        for _ in 0..16 {
+            let chunk = pending.next_chunk();
+            assert_eq!(Arc::strong_count(&pending.bytes), 2);
+            pending.offset += chunk.len();
         }
 
         eprintln!(
             "8 MiB input enqueue returned in {:.3} ms",
             started_at.elapsed().as_secs_f64() * 1_000.0
         );
-        assert_eq!(accepted, 16);
-        assert_eq!(pending.len(), bytes.len() / INPUT_CHUNK_SIZE - accepted);
-        assert!(pending.iter().all(|chunk| chunk.len() <= INPUT_CHUNK_SIZE));
+        assert_eq!(pending.offset, 16 * INPUT_CHUNK_SIZE);
+        assert_eq!(pending.remaining_len(), 8 * 1024 * 1024 - pending.offset);
+    }
+
+    #[test]
+    fn latency_histogram_reports_bounded_percentiles_without_allocating_samples() {
+        let mut histogram = LatencyHistogram::default();
+        for latency in [100, 400, 900, 1_400, 7_500, 40_000] {
+            histogram.record(latency);
+        }
+        assert_eq!(histogram.percentile_upper_us(50), 1_000);
+        assert_eq!(histogram.percentile_upper_us(95), 100_000);
+        histogram.clear();
+        assert_eq!(histogram.percentile_upper_us(95), 0);
     }
 }

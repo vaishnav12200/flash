@@ -51,8 +51,31 @@ pub enum PtyEvent {
 }
 
 pub enum InputEnqueueError {
-    Full(Vec<u8>),
+    Full,
     Closed,
+}
+
+#[derive(Clone)]
+pub struct PtyInput {
+    bytes: Arc<[u8]>,
+    start: usize,
+    end: usize,
+}
+
+impl PtyInput {
+    pub fn new(bytes: Arc<[u8]>, start: usize, end: usize) -> Self {
+        debug_assert!(start <= end && end <= bytes.len());
+        debug_assert!(end - start <= INPUT_CHUNK_SIZE);
+        Self { bytes, start, end }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[self.start..self.end]
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.end - self.start
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -67,7 +90,7 @@ pub struct DrainResult {
 pub struct PtySession {
     master: Option<Box<dyn MasterPty + Send>>,
     child: Option<Box<dyn Child + Send + Sync>>,
-    input_sender: Option<SyncSender<Vec<u8>>>,
+    input_sender: Option<SyncSender<PtyInput>>,
     events: Receiver<PtyEvent>,
     wake_pending: Arc<AtomicBool>,
     input_wake_pending: Arc<AtomicBool>,
@@ -179,16 +202,15 @@ impl PtySession {
     }
 
     /// Enqueues one bounded input chunk without blocking the UI thread.
-    pub fn try_write(&self, bytes: Vec<u8>) -> std::result::Result<(), InputEnqueueError> {
-        if bytes.is_empty() {
+    pub fn try_write(&self, input: PtyInput) -> std::result::Result<(), InputEnqueueError> {
+        if input.len() == 0 {
             return Ok(());
         }
-        debug_assert!(bytes.len() <= INPUT_CHUNK_SIZE);
         let Some(sender) = self.input_sender.as_ref() else {
             return Err(InputEnqueueError::Closed);
         };
-        sender.try_send(bytes).map_err(|error| match error {
-            TrySendError::Full(bytes) => InputEnqueueError::Full(bytes),
+        sender.try_send(input).map_err(|error| match error {
+            TrySendError::Full(_) => InputEnqueueError::Full,
             TrySendError::Disconnected(_) => InputEnqueueError::Closed,
         })
     }
@@ -326,17 +348,19 @@ fn read_pty_output(
 
 fn write_pty_input(
     mut writer: Box<dyn Write + Send>,
-    input_receiver: Receiver<Vec<u8>>,
+    input_receiver: Receiver<PtyInput>,
     event_sender: SyncSender<PtyEvent>,
     event_proxy: EventLoopProxy<AppEvent>,
     output_wake_pending: Arc<AtomicBool>,
     input_wake_pending: Arc<AtomicBool>,
 ) {
-    while let Ok(bytes) = input_receiver.recv() {
+    while let Ok(input) = input_receiver.recv() {
         let started_at = Instant::now();
-        let result = writer.write_all(&bytes).and_then(|()| writer.flush());
+        let result = writer
+            .write_all(input.as_bytes())
+            .and_then(|()| writer.flush());
         tracing::debug!(
-            byte_count = bytes.len(),
+            byte_count = input.len(),
             write_us = started_at.elapsed().as_micros(),
             "latency.pty_input_write"
         );

@@ -10,7 +10,7 @@ use winit::{
 
 use crate::{
     event::AppEvent,
-    font::{ATLAS_SIZE, FontError, GlyphAtlas},
+    font::{ATLAS_SIZE, AtlasRegion, FontError, GlyphAtlas},
     terminal::{Color, Cursor, GridSize, RenderSnapshot},
 };
 
@@ -29,13 +29,20 @@ pub struct RendererSettings {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, PartialEq, Pod, Zeroable)]
 struct GlyphInstance {
     position: [f32; 2],
     size: [f32; 2],
     uv_min: [f32; 2],
     uv_max: [f32; 2],
     color: [f32; 4],
+}
+
+#[derive(Default)]
+struct RowInstances {
+    backgrounds: Vec<GlyphInstance>,
+    overlays: Vec<GlyphInstance>,
+    glyphs: Vec<GlyphInstance>,
 }
 
 #[repr(C)]
@@ -52,12 +59,16 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     atlas: GlyphAtlas,
     atlas_texture: wgpu::Texture,
+    atlas_upload: Vec<u8>,
     bind_group: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
     viewport_buffer: wgpu::Buffer,
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
     instances: Vec<GlyphInstance>,
+    staged_instances: Vec<GlyphInstance>,
+    row_instances: Vec<RowInstances>,
+    row_versions: Vec<u64>,
     settings: RendererSettings,
     scale_factor: f64,
     event_proxy: EventLoopProxy<AppEvent>,
@@ -344,12 +355,16 @@ impl Renderer {
             config,
             atlas,
             atlas_texture,
+            atlas_upload: Vec::new(),
             bind_group,
             pipeline,
             viewport_buffer,
             instance_buffer,
             instance_capacity,
             instances: Vec::with_capacity(instance_capacity),
+            staged_instances: Vec::with_capacity(instance_capacity),
+            row_instances: Vec::new(),
+            row_versions: Vec::new(),
             settings,
             scale_factor,
             event_proxy,
@@ -424,6 +439,8 @@ impl Renderer {
             },
         );
         self.atlas = atlas;
+        self.row_instances.clear();
+        self.row_versions.clear();
     }
 
     pub fn grid_size(&self, size: PhysicalSize<u32>) -> GridSize {
@@ -441,18 +458,10 @@ impl Renderer {
     }
 
     pub fn render(&mut self, snapshot: RenderSnapshot<'_>) -> Result<RenderOutcome, RenderError> {
-        self.atlas.drain_fallbacks();
-        self.build_instances(snapshot);
-        if self.atlas.take_dirty() {
-            self.upload_atlas_pixels();
-        }
-        self.ensure_instance_capacity();
-        if !self.instances.is_empty() {
-            self.queue.write_buffer(
-                &self.instance_buffer,
-                0,
-                bytemuck::cast_slice(&self.instances),
-            );
+        let fallback_changed = self.atlas.drain_fallbacks() > 0;
+        self.build_instances(snapshot, fallback_changed);
+        if let Some(region) = self.atlas.take_dirty_region() {
+            self.upload_atlas_region(region);
         }
         let surface_texture = match self.surface.get_current_texture() {
             Ok(texture) => texture,
@@ -495,19 +504,78 @@ impl Renderer {
         Ok(RenderOutcome::Presented)
     }
 
-    fn build_instances(&mut self, snapshot: RenderSnapshot<'_>) {
-        self.instances.clear();
+    fn build_instances(&mut self, snapshot: RenderSnapshot<'_>, force_rebuild: bool) {
+        let dimensions_changed =
+            self.row_instances.len() != snapshot.rows || self.row_versions.len() != snapshot.rows;
+        if dimensions_changed {
+            self.row_instances
+                .resize_with(snapshot.rows, RowInstances::default);
+            self.row_versions.resize(snapshot.rows, 0);
+        }
 
+        let mut dirty_row_count = 0;
         for row in 0..snapshot.rows {
+            if force_rebuild
+                || dimensions_changed
+                || self.row_versions[row] != snapshot.row_versions[row]
+            {
+                self.row_instances[row] = self.build_row_instances(snapshot, row);
+                self.row_versions[row] = snapshot.row_versions[row];
+                dirty_row_count += 1;
+            }
+        }
+        if dirty_row_count == 0 {
+            return;
+        }
+
+        self.staged_instances.clear();
+        for row in &self.row_instances {
+            self.staged_instances.extend_from_slice(&row.backgrounds);
+        }
+        for row in &self.row_instances {
+            self.staged_instances.extend_from_slice(&row.overlays);
+        }
+        for row in &self.row_instances {
+            self.staged_instances.extend_from_slice(&row.glyphs);
+        }
+        self.upload_changed_instances(dirty_row_count, snapshot.rows);
+    }
+
+    fn build_row_instances(&mut self, snapshot: RenderSnapshot<'_>, row: usize) -> RowInstances {
+        let mut instances = RowInstances::default();
+        for column in 0..snapshot.columns {
+            let cell = snapshot.cells[row * snapshot.columns + column];
+            let background = if cell.flags.inverse() {
+                cell.foreground
+            } else {
+                cell.background
+            };
+            if background != Color::Default {
+                instances.backgrounds.push(GlyphInstance {
+                    position: [
+                        self.settings.padding_x + column as f32 * self.atlas.cell_width,
+                        self.settings.padding_y + row as f32 * self.atlas.cell_height,
+                    ],
+                    size: [self.atlas.cell_width, self.atlas.cell_height],
+                    uv_min: self.atlas.solid_uv_min,
+                    uv_max: self.atlas.solid_uv_max,
+                    color: resolve_color(background, self.settings.background),
+                });
+            }
+        }
+
+        if let Some(selection) = snapshot.selection {
             for column in 0..snapshot.columns {
                 let cell = snapshot.cells[row * snapshot.columns + column];
-                let background = if cell.flags.inverse() {
-                    cell.foreground
-                } else {
-                    cell.background
-                };
-                if background != Color::Default {
-                    self.instances.push(GlyphInstance {
+                let selected = selection.contains(row, column)
+                    || (cell.is_continuation()
+                        && column > 0
+                        && selection.contains(row, column - 1))
+                    || (cell.width.columns() == 2
+                        && column + 1 < snapshot.columns
+                        && selection.contains(row, column + 1));
+                if selected {
+                    instances.overlays.push(GlyphInstance {
                         position: [
                             self.settings.padding_x + column as f32 * self.atlas.cell_width,
                             self.settings.padding_y + row as f32 * self.atlas.cell_height,
@@ -515,55 +583,26 @@ impl Renderer {
                         size: [self.atlas.cell_width, self.atlas.cell_height],
                         uv_min: self.atlas.solid_uv_min,
                         uv_max: self.atlas.solid_uv_max,
-                        color: resolve_color(background, self.settings.background),
+                        color: SELECTION_COLOR,
                     });
                 }
             }
         }
 
-        if let Some(selection) = snapshot.selection {
-            for row in 0..snapshot.rows {
-                for column in 0..snapshot.columns {
-                    let cell = snapshot.cells[row * snapshot.columns + column];
-                    let selected = selection.contains(row, column)
-                        || (cell.is_continuation()
-                            && column > 0
-                            && selection.contains(row, column - 1))
-                        || (cell.width.columns() == 2
-                            && column + 1 < snapshot.columns
-                            && selection.contains(row, column + 1));
-                    if selected {
-                        self.instances.push(GlyphInstance {
-                            position: [
-                                self.settings.padding_x + column as f32 * self.atlas.cell_width,
-                                self.settings.padding_y + row as f32 * self.atlas.cell_height,
-                            ],
-                            size: [self.atlas.cell_width, self.atlas.cell_height],
-                            uv_min: self.atlas.solid_uv_min,
-                            uv_max: self.atlas.solid_uv_max,
-                            color: SELECTION_COLOR,
-                        });
-                    }
-                }
-            }
-        }
-
-        if snapshot.cursor_visible {
+        if snapshot.cursor_visible && snapshot.cursor.row == row {
             let mut cursor_column = snapshot.cursor.column;
-            let cursor_cell =
-                snapshot.cells[snapshot.cursor.row * snapshot.columns + snapshot.cursor.column];
+            let cursor_cell = snapshot.cells[row * snapshot.columns + cursor_column];
             if cursor_cell.is_continuation() && cursor_column > 0 {
                 cursor_column -= 1;
             }
-            let cursor_width = snapshot.cells
-                [snapshot.cursor.row * snapshot.columns + cursor_column]
+            let cursor_width = snapshot.cells[row * snapshot.columns + cursor_column]
                 .width
                 .columns()
                 .max(1) as f32;
-            self.instances.push(GlyphInstance {
+            instances.overlays.push(GlyphInstance {
                 position: [
                     self.settings.padding_x + cursor_column as f32 * self.atlas.cell_width,
-                    self.settings.padding_y + snapshot.cursor.row as f32 * self.atlas.cell_height,
+                    self.settings.padding_y + row as f32 * self.atlas.cell_height,
                 ],
                 size: [self.atlas.cell_width * cursor_width, self.atlas.cell_height],
                 uv_min: self.atlas.solid_uv_min,
@@ -572,91 +611,195 @@ impl Renderer {
             });
         }
 
-        for row in 0..snapshot.rows {
-            for column in 0..snapshot.columns {
-                let cell = snapshot.cells[row * snapshot.columns + column];
-                if cell.is_continuation() {
-                    continue;
-                }
-                let foreground = if cell.flags.inverse() {
-                    cell.background
-                } else {
-                    cell.foreground
-                };
-                let cell_width = self.atlas.cell_width;
-                let cell_height = self.atlas.cell_height;
-                let occupied_width = cell.width.columns() as f32 * cell_width;
-                for character in cell.characters().filter(|character| {
-                    !matches!(
-                        *character,
-                        '\u{200c}' | '\u{200d}' | '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}'
-                    )
-                }) {
-                    if let Some(glyph) = self
-                        .atlas
-                        .glyph(character)
-                        .filter(|glyph| glyph.width > 0.0 && glyph.height > 0.0)
-                    {
-                        let centered_advance = (occupied_width - glyph.advance_width) * 0.5;
-                        self.instances.push(GlyphInstance {
-                            position: [
-                                self.settings.padding_x
-                                    + column as f32 * cell_width
-                                    + centered_advance
-                                    + glyph.x_offset,
-                                self.settings.padding_y + row as f32 * cell_height + glyph.y_offset,
-                            ],
-                            size: [glyph.width, glyph.height],
-                            uv_min: glyph.uv_min,
-                            uv_max: glyph.uv_max,
-                            color: resolve_color(foreground, self.settings.foreground),
-                        });
-                    }
-                }
-                if cell.flags.underline() {
-                    self.instances.push(GlyphInstance {
+        for column in 0..snapshot.columns {
+            let cell = snapshot.cells[row * snapshot.columns + column];
+            if cell.is_continuation() {
+                continue;
+            }
+            let foreground = if cell.flags.inverse() {
+                cell.background
+            } else {
+                cell.foreground
+            };
+            let cell_width = self.atlas.cell_width;
+            let cell_height = self.atlas.cell_height;
+            let occupied_width = cell.width.columns() as f32 * cell_width;
+            for character in cell.characters().filter(|character| {
+                !matches!(
+                    *character,
+                    '\u{200c}' | '\u{200d}' | '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}'
+                )
+            }) {
+                if let Some(glyph) = self
+                    .atlas
+                    .glyph(character)
+                    .filter(|glyph| glyph.width > 0.0 && glyph.height > 0.0)
+                {
+                    let centered_advance = (occupied_width - glyph.advance_width) * 0.5;
+                    instances.glyphs.push(GlyphInstance {
                         position: [
-                            self.settings.padding_x + column as f32 * self.atlas.cell_width,
-                            self.settings.padding_y + (row + 1) as f32 * cell_height - 2.0,
+                            self.settings.padding_x
+                                + column as f32 * cell_width
+                                + centered_advance
+                                + glyph.x_offset,
+                            self.settings.padding_y + row as f32 * cell_height + glyph.y_offset,
                         ],
-                        size: [occupied_width, 1.0],
-                        uv_min: self.atlas.solid_uv_min,
-                        uv_max: self.atlas.solid_uv_max,
+                        size: [glyph.width, glyph.height],
+                        uv_min: glyph.uv_min,
+                        uv_max: glyph.uv_max,
                         color: resolve_color(foreground, self.settings.foreground),
                     });
                 }
             }
+            if cell.flags.underline() {
+                instances.glyphs.push(GlyphInstance {
+                    position: [
+                        self.settings.padding_x + column as f32 * self.atlas.cell_width,
+                        self.settings.padding_y + (row + 1) as f32 * cell_height - 2.0,
+                    ],
+                    size: [occupied_width, 1.0],
+                    uv_min: self.atlas.solid_uv_min,
+                    uv_max: self.atlas.solid_uv_max,
+                    color: resolve_color(foreground, self.settings.foreground),
+                });
+            }
         }
+        instances
     }
 
-    fn upload_atlas_pixels(&self) {
+    fn upload_changed_instances(&mut self, dirty_rows: usize, total_rows: usize) {
+        let reallocated = self.ensure_instance_capacity(self.staged_instances.len());
+        let mut uploaded_instance_count = 0;
+        let mut write_count = 0;
+        if reallocated && !self.staged_instances.is_empty() {
+            self.queue.write_buffer(
+                &self.instance_buffer,
+                0,
+                bytemuck::cast_slice(&self.staged_instances),
+            );
+            uploaded_instance_count = self.staged_instances.len();
+            write_count = 1;
+        } else if !reallocated {
+            let common_len = self.instances.len().min(self.staged_instances.len());
+            let mut change_run_count = 0;
+            let mut index = 0;
+            while index < common_len {
+                if self.instances[index] == self.staged_instances[index] {
+                    index += 1;
+                    continue;
+                }
+                change_run_count += 1;
+                while index < common_len && self.instances[index] != self.staged_instances[index] {
+                    index += 1;
+                }
+            }
+
+            if change_run_count > 8 {
+                let first_changed = self
+                    .instances
+                    .iter()
+                    .zip(&self.staged_instances)
+                    .position(|(old, new)| old != new)
+                    .unwrap_or(common_len);
+                if first_changed < self.staged_instances.len() {
+                    self.write_instance_range(first_changed, self.staged_instances.len());
+                    uploaded_instance_count = self.staged_instances.len() - first_changed;
+                    write_count = 1;
+                }
+            } else {
+                index = 0;
+                while index < common_len {
+                    if self.instances[index] == self.staged_instances[index] {
+                        index += 1;
+                        continue;
+                    }
+                    let start = index;
+                    while index < common_len
+                        && self.instances[index] != self.staged_instances[index]
+                    {
+                        index += 1;
+                    }
+                    self.write_instance_range(start, index);
+                    uploaded_instance_count += index - start;
+                    write_count += 1;
+                }
+                if self.staged_instances.len() > common_len {
+                    self.write_instance_range(common_len, self.staged_instances.len());
+                    uploaded_instance_count += self.staged_instances.len() - common_len;
+                    write_count += 1;
+                }
+            }
+        }
+        tracing::debug!(
+            dirty_rows,
+            total_rows,
+            instance_count = self.staged_instances.len(),
+            uploaded_instance_count,
+            write_count,
+            "renderer instance cache updated"
+        );
+        mem::swap(&mut self.instances, &mut self.staged_instances);
+    }
+
+    fn write_instance_range(&self, start: usize, end: usize) {
+        self.queue.write_buffer(
+            &self.instance_buffer,
+            (start * mem::size_of::<GlyphInstance>()) as u64,
+            bytemuck::cast_slice(&self.staged_instances[start..end]),
+        );
+    }
+
+    fn upload_atlas_region(&mut self, region: AtlasRegion) {
+        let byte_count = (region.width * region.height) as usize;
+        self.atlas_upload.resize(byte_count, 0);
+        for row in 0..region.height as usize {
+            let source_start = (region.y as usize + row) * ATLAS_SIZE as usize + region.x as usize;
+            let destination_start = row * region.width as usize;
+            self.atlas_upload[destination_start..destination_start + region.width as usize]
+                .copy_from_slice(
+                    &self.atlas.pixels[source_start..source_start + region.width as usize],
+                );
+        }
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &self.atlas_texture,
                 mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
+                origin: wgpu::Origin3d {
+                    x: region.x,
+                    y: region.y,
+                    z: 0,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
-            &self.atlas.pixels,
+            &self.atlas_upload,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(ATLAS_SIZE),
-                rows_per_image: Some(ATLAS_SIZE),
+                bytes_per_row: Some(region.width),
+                rows_per_image: Some(region.height),
             },
             wgpu::Extent3d {
-                width: ATLAS_SIZE,
-                height: ATLAS_SIZE,
+                width: region.width,
+                height: region.height,
                 depth_or_array_layers: 1,
             },
         );
+        tracing::debug!(
+            x = region.x,
+            y = region.y,
+            width = region.width,
+            height = region.height,
+            byte_count,
+            "uploaded glyph atlas damage"
+        );
     }
 
-    fn ensure_instance_capacity(&mut self) {
-        if self.instances.len() <= self.instance_capacity {
-            return;
+    fn ensure_instance_capacity(&mut self, required: usize) -> bool {
+        if required <= self.instance_capacity {
+            return false;
         }
-        self.instance_capacity = self.instances.len().next_power_of_two();
+        self.instance_capacity = required.next_power_of_two();
         self.instance_buffer = create_instance_buffer(&self.device, self.instance_capacity);
+        true
     }
 
     fn configure(&mut self, size: PhysicalSize<u32>) {

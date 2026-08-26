@@ -157,6 +157,7 @@ pub struct RenderSnapshot<'a> {
     pub cursor: Cursor,
     pub cursor_visible: bool,
     pub selection: Option<Selection>,
+    pub row_versions: &'a [u64],
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +225,10 @@ pub struct Terminal {
     viewport_offset: usize,
     viewport_cells: Vec<Cell>,
     selection: Option<Selection>,
+    row_versions: Vec<u64>,
+    next_damage_version: u64,
+    damage_batching: bool,
+    pending_damage: Option<(usize, usize)>,
 }
 
 impl Terminal {
@@ -248,6 +253,10 @@ impl Terminal {
             viewport_offset: 0,
             viewport_cells: vec![Cell::default(); cell_count],
             selection: None,
+            row_versions: vec![1; rows],
+            next_damage_version: 2,
+            damage_batching: false,
+            pending_damage: None,
         }
     }
 
@@ -275,18 +284,24 @@ impl Terminal {
         self.viewport_cells = vec![Cell::default(); size.rows * size.columns];
         self.viewport_offset = self.viewport_offset.min(self.history.len());
         self.selection = None;
+        self.row_versions = vec![0; size.rows];
+        self.damage_all();
         self.reset_scroll_region();
         self.refresh_viewport();
         true
     }
 
     pub fn set_scrollback_limit(&mut self, limit: usize) {
+        let old_offset = self.viewport_offset;
         self.history_limit = limit;
         while self.history.len() > limit {
             self.history.pop_front();
         }
         self.viewport_offset = self.viewport_offset.min(self.history.len());
         self.refresh_viewport();
+        if self.viewport_offset != old_offset {
+            self.damage_all();
+        }
     }
 
     pub fn scroll_viewport(&mut self, lines: isize) {
@@ -303,6 +318,7 @@ impl Terminal {
         }
         self.selection = None;
         self.refresh_viewport();
+        self.damage_all();
     }
 
     pub fn scroll_page_up(&mut self) {
@@ -312,27 +328,43 @@ impl Terminal {
         self.scroll_viewport(-((self.rows.saturating_sub(1)) as isize));
     }
     pub fn scroll_to_bottom(&mut self) {
+        let changed = self.viewport_offset != 0 || self.selection.is_some();
         self.viewport_offset = 0;
         self.selection = None;
+        if changed {
+            self.damage_all();
+        }
     }
 
     pub fn begin_selection(&mut self, cell: Cursor) {
+        if let Some(selection) = self.selection {
+            self.damage_selection(selection);
+        }
         let cell = self.clamp_cell(cell);
         self.selection = Some(Selection {
             start: cell,
             end: cell,
         });
+        self.damage_row(cell.row);
     }
 
     pub fn update_selection(&mut self, cell: Cursor) {
         let cell = self.clamp_cell(cell);
+        if let Some(old_selection) = self.selection {
+            self.damage_selection(old_selection);
+        }
         if let Some(selection) = self.selection.as_mut() {
             selection.end = cell;
+        }
+        if let Some(selection) = self.selection {
+            self.damage_selection(selection);
         }
     }
 
     pub fn clear_selection(&mut self) {
-        self.selection = None;
+        if let Some(selection) = self.selection.take() {
+            self.damage_selection(selection);
+        }
     }
 
     pub fn selected_text(&self) -> Option<String> {
@@ -371,15 +403,39 @@ impl Terminal {
         self.bracketed_paste
     }
 
-    pub(crate) fn finish_output(&mut self) {
-        self.selection = None;
-        self.refresh_viewport();
+    pub(crate) fn begin_output(&mut self) {
+        debug_assert!(
+            !self.damage_batching,
+            "terminal output batches must not nest"
+        );
+        self.damage_batching = true;
+        self.pending_damage = None;
+        self.damage_row(self.active().cursor.row);
     }
 
+    pub(crate) fn finish_output(&mut self) {
+        self.clear_selection();
+        self.refresh_viewport();
+        self.damage_batching = false;
+        if let Some((first, last)) = self.pending_damage.take() {
+            self.apply_damage_rows(first, last);
+        }
+    }
+
+    #[cfg(test)]
     pub fn print(&mut self, character: char) {
+        self.print_impl(character, true);
+    }
+
+    pub(crate) fn print_output(&mut self, character: char) {
+        self.print_impl(character, false);
+    }
+
+    #[inline]
+    fn print_impl(&mut self, character: char, track_damage: bool) {
         let unicode_width = UnicodeWidthChar::width(character).unwrap_or(0).min(2);
         if unicode_width == 0 || self.should_join_previous(character) {
-            self.append_to_previous(character);
+            self.append_to_previous(character, track_damage);
             return;
         }
 
@@ -431,49 +487,73 @@ impl Terminal {
         } else {
             self.active_mut().cursor.column += width;
         }
+        if track_damage {
+            self.damage_row(cursor.row);
+        }
     }
 
     pub fn carriage_return(&mut self) {
+        let cursor = self.active().cursor;
+        let changed = cursor.column != 0 || self.active().wrap_pending;
         self.active_mut().cursor.column = 0;
         self.active_mut().wrap_pending = false;
+        if changed && !self.damage_batching {
+            self.damage_row(cursor.row);
+        }
     }
 
     pub fn line_feed(&mut self) {
         let row = self.active().cursor.row;
         if row == self.scroll_bottom {
             self.scroll_up(1);
+            self.active_mut().wrap_pending = false;
+            return;
         } else if row + 1 < self.rows {
             self.active_mut().cursor.row += 1;
         }
         self.active_mut().wrap_pending = false;
+        self.damage_row(row);
+        self.damage_row(self.active().cursor.row);
     }
 
     pub fn reverse_index(&mut self) {
         let row = self.active().cursor.row;
         if row == self.scroll_top {
             self.scroll_down(1);
+            self.active_mut().wrap_pending = false;
+            return;
         } else {
             self.active_mut().cursor.row = row.saturating_sub(1);
         }
         self.active_mut().wrap_pending = false;
+        self.damage_row(row);
+        self.damage_row(self.active().cursor.row);
     }
 
     pub fn backspace(&mut self) {
-        let column = self.active().cursor.column;
-        self.active_mut().cursor.column = column.saturating_sub(1);
+        let cursor = self.active().cursor;
+        let changed = cursor.column != 0 || self.active().wrap_pending;
+        self.active_mut().cursor.column = cursor.column.saturating_sub(1);
         self.active_mut().wrap_pending = false;
+        if changed && !self.damage_batching {
+            self.damage_row(cursor.row);
+        }
     }
 
     pub fn tab(&mut self) {
-        let column = self.active().cursor.column;
+        let cursor = self.active().cursor;
+        let column = cursor.column;
         self.active_mut().cursor.column =
             (((column / TAB_WIDTH) + 1) * TAB_WIDTH).min(self.columns - 1);
         self.active_mut().wrap_pending = false;
+        if self.active().cursor != cursor && !self.damage_batching {
+            self.damage_row(cursor.row);
+        }
     }
 
     pub fn move_cursor_relative(&mut self, row_delta: isize, column_delta: isize) {
         let cursor = self.active().cursor;
-        self.active_mut().cursor = Cursor {
+        let new_cursor = Cursor {
             row: cursor
                 .row
                 .saturating_add_signed(row_delta)
@@ -483,23 +563,37 @@ impl Terminal {
                 .saturating_add_signed(column_delta)
                 .min(self.columns - 1),
         };
+        self.active_mut().cursor = new_cursor;
         self.active_mut().wrap_pending = false;
+        if new_cursor != cursor {
+            self.damage_row(cursor.row);
+            self.damage_row(new_cursor.row);
+        }
     }
 
     pub fn set_cursor(&mut self, row: usize, column: usize) {
-        self.active_mut().cursor = Cursor {
+        let old_cursor = self.active().cursor;
+        let new_cursor = Cursor {
             row: row.min(self.rows - 1),
             column: column.min(self.columns - 1),
         };
+        self.active_mut().cursor = new_cursor;
         self.active_mut().wrap_pending = false;
+        if new_cursor != old_cursor {
+            self.damage_row(old_cursor.row);
+            self.damage_row(new_cursor.row);
+        }
     }
 
     pub fn save_cursor(&mut self) {
         self.active_mut().saved_cursor = self.active().cursor;
     }
     pub fn restore_cursor(&mut self) {
+        let old_row = self.active().cursor.row;
         self.active_mut().cursor = self.active().saved_cursor;
         self.active_mut().wrap_pending = false;
+        self.damage_row(old_row);
+        self.damage_row(self.active().cursor.row);
     }
 
     pub fn erase_display(&mut self, mode: u16) {
@@ -507,9 +601,18 @@ impl Terminal {
         let index = self.index(cursor.row, cursor.column);
         let blank = self.blank_cell();
         match mode {
-            0 => self.active_mut().cells[index..].fill(blank),
-            1 => self.active_mut().cells[..=index].fill(blank),
-            2 | 3 => self.active_mut().cells.fill(blank),
+            0 => {
+                self.active_mut().cells[index..].fill(blank);
+                self.damage_rows(cursor.row, self.rows - 1);
+            }
+            1 => {
+                self.active_mut().cells[..=index].fill(blank);
+                self.damage_rows(0, cursor.row);
+            }
+            2 | 3 => {
+                self.active_mut().cells.fill(blank);
+                self.damage_all();
+            }
             _ => {}
         }
         self.normalize_active_rows(0, self.rows - 1);
@@ -527,6 +630,7 @@ impl Terminal {
             _ => {}
         }
         self.normalize_active_rows(cursor.row, cursor.row);
+        self.damage_row(cursor.row);
     }
 
     pub fn erase_characters(&mut self, count: usize) {
@@ -536,6 +640,7 @@ impl Terminal {
         let blank = self.blank_cell();
         self.active_mut().cells[start..end].fill(blank);
         self.normalize_active_rows(cursor.row, cursor.row);
+        self.damage_row(cursor.row);
     }
 
     pub fn insert_characters(&mut self, count: usize) {
@@ -549,6 +654,7 @@ impl Terminal {
         let blank = self.blank_cell();
         self.active_mut().cells[start..start + count].fill(blank);
         self.normalize_active_rows(cursor.row, cursor.row);
+        self.damage_row(cursor.row);
     }
 
     pub fn delete_characters(&mut self, count: usize) {
@@ -562,6 +668,7 @@ impl Terminal {
         let blank = self.blank_cell();
         self.active_mut().cells[end - count..end].fill(blank);
         self.normalize_active_rows(cursor.row, cursor.row);
+        self.damage_row(cursor.row);
     }
 
     pub fn insert_lines(&mut self, count: usize) {
@@ -600,6 +707,9 @@ impl Terminal {
         self.scroll_bottom = self.rows - 1;
     }
     pub fn set_cursor_visible(&mut self, visible: bool) {
+        if self.cursor_visible != visible {
+            self.damage_row(self.active().cursor.row);
+        }
         self.cursor_visible = visible;
     }
     pub fn set_auto_wrap(&mut self, enabled: bool) {
@@ -627,14 +737,21 @@ impl Terminal {
         self.viewport_offset = 0;
         self.selection = None;
         self.reset_scroll_region();
+        self.damage_all();
     }
 
     pub fn reset(&mut self) {
         let rows = self.rows;
         let columns = self.columns;
         let history_limit = self.history_limit;
+        let next_damage_version = self.next_damage_version;
+        let damage_batching = self.damage_batching;
         *self = Self::new(rows, columns);
         self.history_limit = history_limit;
+        self.row_versions.fill(0);
+        self.next_damage_version = next_damage_version;
+        self.damage_batching = damage_batching;
+        self.damage_all();
     }
 
     pub fn reset_attributes(&mut self) {
@@ -668,6 +785,7 @@ impl Terminal {
             cursor: screen.cursor,
             cursor_visible: self.cursor_visible && self.viewport_offset == 0,
             selection: self.selection,
+            row_versions: &self.row_versions,
         }
     }
 
@@ -676,12 +794,20 @@ impl Terminal {
         let columns = self.columns;
         if !self.alternate_active && top == 0 && bottom + 1 == self.rows {
             for row in 0..count {
+                if self.history_limit == 0 {
+                    break;
+                }
                 let start = row * columns;
-                self.history
-                    .push_back(self.primary.cells[start..start + columns].to_vec());
-            }
-            while self.history.len() > self.history_limit {
-                self.history.pop_front();
+                let mut line = if self.history.len() >= self.history_limit {
+                    self.history
+                        .pop_front()
+                        .expect("full scrollback has a reusable row")
+                } else {
+                    Vec::with_capacity(columns)
+                };
+                line.clear();
+                line.extend_from_slice(&self.primary.cells[start..start + columns]);
+                self.history.push_back(line);
             }
             if self.viewport_offset > 0 {
                 self.viewport_offset = self
@@ -694,6 +820,7 @@ impl Terminal {
         self.active_mut().cells.copy_within(source, top * columns);
         let blank = self.blank_cell();
         self.active_mut().cells[(bottom + 1 - count) * columns..(bottom + 1) * columns].fill(blank);
+        self.damage_rows(top, bottom);
     }
 
     fn scroll_region_down(&mut self, top: usize, bottom: usize, count: usize) {
@@ -705,6 +832,7 @@ impl Terminal {
             .copy_within(source, (top + count) * columns);
         let blank = self.blank_cell();
         self.active_mut().cells[top * columns..(top + count) * columns].fill(blank);
+        self.damage_rows(top, bottom);
     }
 
     fn refresh_viewport(&mut self) {
@@ -795,7 +923,7 @@ impl Terminal {
                     .any(is_regional_indicator))
     }
 
-    fn append_to_previous(&mut self, character: char) {
+    fn append_to_previous(&mut self, character: char, track_damage: bool) {
         if let Some(index) = self.previous_cell_index() {
             if (is_regional_indicator(character)
                 && is_regional_indicator(self.active().cells[index].character))
@@ -804,14 +932,20 @@ impl Terminal {
                 self.promote_cell_to_wide(index);
             }
             self.active_mut().cells[index].append(character);
+            if track_damage {
+                self.damage_row(index / self.columns);
+            }
             return;
         }
 
         // A leading combining mark has no base. A dotted circle makes the
         // otherwise invisible sequence inspectable without consuming extra cells.
-        self.print('\u{25cc}');
+        self.print_impl('\u{25cc}', track_damage);
         if let Some(index) = self.previous_cell_index() {
             self.active_mut().cells[index].append(character);
+            if track_damage {
+                self.damage_row(index / self.columns);
+            }
         }
     }
 
@@ -869,6 +1003,61 @@ impl Terminal {
         for row in first..=last {
             normalize_row(cells, columns, row, blank);
         }
+    }
+
+    fn damage_selection(&mut self, selection: Selection) {
+        self.damage_rows(
+            selection.start.row.min(selection.end.row),
+            selection.start.row.max(selection.end.row),
+        );
+    }
+
+    fn damage_all(&mut self) {
+        self.damage_rows(0, self.rows - 1);
+    }
+
+    #[inline]
+    fn damage_row(&mut self, row: usize) {
+        if self.damage_batching && self.pending_damage == Some((0, self.rows - 1)) {
+            return;
+        }
+        self.damage_rows(row, row);
+    }
+
+    #[inline]
+    fn damage_rows(&mut self, first: usize, last: usize) {
+        if self.row_versions.is_empty() {
+            return;
+        }
+        let first = first.min(self.row_versions.len() - 1);
+        let last = last.min(self.row_versions.len() - 1);
+        if first > last {
+            return;
+        }
+        if self.damage_batching {
+            if self.pending_damage == Some((0, self.rows - 1)) {
+                return;
+            }
+            self.pending_damage = Some(
+                self.pending_damage
+                    .map_or((first, last), |(pending_first, pending_last)| {
+                        (pending_first.min(first), pending_last.max(last))
+                    }),
+            );
+            return;
+        }
+        self.apply_damage_rows(first, last);
+    }
+
+    fn apply_damage_rows(&mut self, first: usize, last: usize) {
+        let version = self.next_damage_version;
+        if version == u64::MAX {
+            self.row_versions.fill(1);
+            self.next_damage_version = 2;
+            return;
+        }
+        self.row_versions[first..=last].fill(version);
+        self.next_damage_version += 1;
     }
 }
 
@@ -1114,5 +1303,46 @@ mod tests {
         );
         assert_eq!(terminal.active().cells[1].width, CellWidth::Continuation);
         assert_eq!(terminal.active().cells[3].width, CellWidth::Continuation);
+    }
+
+    #[test]
+    fn damage_versions_identify_only_changed_rows() {
+        let mut terminal = Terminal::new(3, 4);
+        let initial = terminal.render_snapshot().row_versions.to_vec();
+        terminal.set_cursor(1, 0);
+        terminal.print('x');
+        let changed = terminal.render_snapshot().row_versions;
+        assert_ne!(changed[0], initial[0]);
+        assert_ne!(changed[1], initial[1]);
+        assert_eq!(changed[2], initial[2]);
+    }
+
+    #[test]
+    fn reset_and_resize_force_fresh_full_grid_damage() {
+        let mut terminal = Terminal::new(2, 3);
+        let initial = terminal.render_snapshot().row_versions.to_vec();
+        terminal.reset();
+        assert!(
+            terminal
+                .render_snapshot()
+                .row_versions
+                .iter()
+                .zip(&initial)
+                .all(|(reset, old)| reset != old)
+        );
+
+        let reset = terminal.render_snapshot().row_versions.to_vec();
+        terminal.resize(super::GridSize {
+            rows: 2,
+            columns: 4,
+        });
+        assert!(
+            terminal
+                .render_snapshot()
+                .row_versions
+                .iter()
+                .zip(&reset)
+                .all(|(resized, old)| resized != old)
+        );
     }
 }
