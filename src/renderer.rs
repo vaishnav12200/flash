@@ -9,13 +9,11 @@ use winit::{
 };
 
 use crate::{
+    config::{CursorStyle, srgb_to_linear},
     event::AppEvent,
     font::{ATLAS_SIZE, AtlasRegion, FontError, GlyphAtlas},
-    terminal::{Color, Cursor, GridSize, RenderSnapshot},
+    terminal::{Cell, Color, Cursor, GridSize, RenderSnapshot},
 };
-
-const CURSOR_COLOR: [f32; 4] = [0.55, 0.58, 0.65, 0.65];
-const SELECTION_COLOR: [f32; 4] = [0.25, 0.42, 0.68, 0.72];
 
 #[derive(Debug, Clone)]
 pub struct RendererSettings {
@@ -26,6 +24,11 @@ pub struct RendererSettings {
     pub padding_y: f32,
     pub foreground: [f32; 4],
     pub background: [f32; 4],
+    pub cursor: [f32; 4],
+    pub cursor_style: CursorStyle,
+    pub selection_background: [f32; 4],
+    pub selection_foreground: [f32; 4],
+    pub ansi: [[f32; 4]; 16],
 }
 
 #[repr(C)]
@@ -36,13 +39,15 @@ struct GlyphInstance {
     uv_min: [f32; 2],
     uv_max: [f32; 2],
     color: [f32; 4],
+    style: [f32; 2],
 }
 
 #[derive(Default)]
 struct RowInstances {
     backgrounds: Vec<GlyphInstance>,
-    overlays: Vec<GlyphInstance>,
+    selections: Vec<GlyphInstance>,
     glyphs: Vec<GlyphInstance>,
+    cursor: Vec<GlyphInstance>,
 }
 
 #[repr(C)]
@@ -69,6 +74,8 @@ pub struct Renderer {
     staged_instances: Vec<GlyphInstance>,
     row_instances: Vec<RowInstances>,
     row_versions: Vec<u64>,
+    cached_columns: usize,
+    surface_configured: bool,
     settings: RendererSettings,
     scale_factor: f64,
     event_proxy: EventLoopProxy<AppEvent>,
@@ -82,7 +89,6 @@ pub enum RendererInitError {
     NoSurfaceFormat,
     NoPresentMode,
     NoAlphaMode,
-    Font(FontError),
 }
 
 impl fmt::Display for RendererInitError {
@@ -102,7 +108,6 @@ impl fmt::Display for RendererInitError {
             Self::NoAlphaMode => {
                 formatter.write_str("GPU surface exposed no supported alpha modes")
             }
-            Self::Font(error) => write!(formatter, "could not initialize default font: {error}"),
         }
     }
 }
@@ -113,6 +118,8 @@ impl Error for RendererInitError {}
 pub enum RenderOutcome {
     Presented,
     Reconfigured,
+    Skipped,
+    TimedOut,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +141,7 @@ impl Renderer {
         scale_factor: f64,
         event_proxy: EventLoopProxy<AppEvent>,
         settings: RendererSettings,
+        atlas: GlyphAtlas,
     ) -> Result<Self, RendererInitError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
@@ -196,14 +204,6 @@ impl Renderer {
             desired_maximum_frame_latency: 2,
         };
 
-        let atlas = GlyphAtlas::load(
-            &settings.font_path,
-            &settings.fallback_font_paths,
-            settings.font_size,
-            scale_factor,
-            Some(event_proxy.clone()),
-        )
-        .map_err(RendererInitError::Font)?;
         let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Flash ASCII glyph atlas"),
             size: wgpu::Extent3d {
@@ -316,7 +316,7 @@ impl Renderer {
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
-        let attributes = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x2, 3 => Float32x2, 4 => Float32x4];
+        let attributes = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x2, 3 => Float32x2, 4 => Float32x4, 5 => Float32x2];
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Flash glyph pipeline"),
             layout: Some(&pipeline_layout),
@@ -365,6 +365,8 @@ impl Renderer {
             staged_instances: Vec::with_capacity(instance_capacity),
             row_instances: Vec::new(),
             row_versions: Vec::new(),
+            cached_columns: 0,
+            surface_configured: false,
             settings,
             scale_factor,
             event_proxy,
@@ -389,7 +391,10 @@ impl Renderer {
             scale_factor,
             Some(self.event_proxy.clone()),
         )?;
+        let scale_ratio = (scale_factor / self.scale_factor) as f32;
         self.upload_atlas(atlas);
+        self.settings.padding_x *= scale_ratio;
+        self.settings.padding_y *= scale_ratio;
         self.scale_factor = scale_factor;
         Ok(())
     }
@@ -458,6 +463,9 @@ impl Renderer {
     }
 
     pub fn render(&mut self, snapshot: RenderSnapshot<'_>) -> Result<RenderOutcome, RenderError> {
+        if !self.surface_configured {
+            return Ok(RenderOutcome::Skipped);
+        }
         let fallback_changed = self.atlas.drain_fallbacks() > 0;
         self.build_instances(snapshot, fallback_changed);
         if let Some(region) = self.atlas.take_dirty_region() {
@@ -470,7 +478,7 @@ impl Renderer {
                 self.surface.configure(&self.device, &self.config);
                 return Ok(RenderOutcome::Reconfigured);
             }
-            Err(wgpu::SurfaceError::Timeout) => return Ok(RenderOutcome::Presented),
+            Err(wgpu::SurfaceError::Timeout) => return Ok(RenderOutcome::TimedOut),
             Err(wgpu::SurfaceError::OutOfMemory) => return Err(RenderError::OutOfMemory),
         };
         let view = surface_texture.texture.create_view(&Default::default());
@@ -497,6 +505,13 @@ impl Renderer {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
+            let content =
+                self.content_size(PhysicalSize::new(self.config.width, self.config.height));
+            let scissor_x = self.settings.padding_x.max(0.0) as u32;
+            let scissor_y = self.settings.padding_y.max(0.0) as u32;
+            if content.width > 0 && content.height > 0 {
+                pass.set_scissor_rect(scissor_x, scissor_y, content.width, content.height);
+            }
             pass.draw(0..6, 0..self.instances.len() as u32);
         }
         self.queue.submit([encoder.finish()]);
@@ -505,12 +520,14 @@ impl Renderer {
     }
 
     fn build_instances(&mut self, snapshot: RenderSnapshot<'_>, force_rebuild: bool) {
-        let dimensions_changed =
-            self.row_instances.len() != snapshot.rows || self.row_versions.len() != snapshot.rows;
+        let dimensions_changed = self.row_instances.len() != snapshot.rows
+            || self.row_versions.len() != snapshot.rows
+            || self.cached_columns != snapshot.columns;
         if dimensions_changed {
             self.row_instances
                 .resize_with(snapshot.rows, RowInstances::default);
             self.row_versions.resize(snapshot.rows, 0);
+            self.cached_columns = snapshot.columns;
         }
 
         let mut dirty_row_count = 0;
@@ -519,7 +536,9 @@ impl Renderer {
                 || dimensions_changed
                 || self.row_versions[row] != snapshot.row_versions[row]
             {
-                self.row_instances[row] = self.build_row_instances(snapshot, row);
+                let mut instances = mem::take(&mut self.row_instances[row]);
+                self.build_row_instances(snapshot, row, &mut instances);
+                self.row_instances[row] = instances;
                 self.row_versions[row] = snapshot.row_versions[row];
                 dirty_row_count += 1;
             }
@@ -533,24 +552,36 @@ impl Renderer {
             self.staged_instances.extend_from_slice(&row.backgrounds);
         }
         for row in &self.row_instances {
-            self.staged_instances.extend_from_slice(&row.overlays);
+            self.staged_instances.extend_from_slice(&row.selections);
         }
         for row in &self.row_instances {
             self.staged_instances.extend_from_slice(&row.glyphs);
         }
+        for row in &self.row_instances {
+            self.staged_instances.extend_from_slice(&row.cursor);
+        }
         self.upload_changed_instances(dirty_row_count, snapshot.rows);
     }
 
-    fn build_row_instances(&mut self, snapshot: RenderSnapshot<'_>, row: usize) -> RowInstances {
-        let mut instances = RowInstances::default();
+    fn build_row_instances(
+        &mut self,
+        snapshot: RenderSnapshot<'_>,
+        row: usize,
+        instances: &mut RowInstances,
+    ) {
+        instances.backgrounds.clear();
+        instances.selections.clear();
+        instances.glyphs.clear();
+        instances.cursor.clear();
         for column in 0..snapshot.columns {
             let cell = snapshot.cells[row * snapshot.columns + column];
-            let background = if cell.flags.inverse() {
-                cell.foreground
-            } else {
-                cell.background
-            };
-            if background != Color::Default {
+            let (_, background) = resolve_cell_colors(
+                cell,
+                self.settings.foreground,
+                self.settings.background,
+                &self.settings.ansi,
+            );
+            if cell.background != Color::Default || cell.flags.inverse() {
                 instances.backgrounds.push(GlyphInstance {
                     position: [
                         self.settings.padding_x + column as f32 * self.atlas.cell_width,
@@ -559,7 +590,8 @@ impl Renderer {
                     size: [self.atlas.cell_width, self.atlas.cell_height],
                     uv_min: self.atlas.solid_uv_min,
                     uv_max: self.atlas.solid_uv_max,
-                    color: resolve_color(background, self.settings.background),
+                    color: background,
+                    style: [0.0; 2],
                 });
             }
         }
@@ -575,7 +607,7 @@ impl Renderer {
                         && column + 1 < snapshot.columns
                         && selection.contains(row, column + 1));
                 if selected {
-                    instances.overlays.push(GlyphInstance {
+                    instances.selections.push(GlyphInstance {
                         position: [
                             self.settings.padding_x + column as f32 * self.atlas.cell_width,
                             self.settings.padding_y + row as f32 * self.atlas.cell_height,
@@ -583,7 +615,8 @@ impl Renderer {
                         size: [self.atlas.cell_width, self.atlas.cell_height],
                         uv_min: self.atlas.solid_uv_min,
                         uv_max: self.atlas.solid_uv_max,
-                        color: SELECTION_COLOR,
+                        color: self.settings.selection_background,
+                        style: [0.0; 2],
                     });
                 }
             }
@@ -599,15 +632,27 @@ impl Renderer {
                 .width
                 .columns()
                 .max(1) as f32;
-            instances.overlays.push(GlyphInstance {
-                position: [
-                    self.settings.padding_x + cursor_column as f32 * self.atlas.cell_width,
-                    self.settings.padding_y + row as f32 * self.atlas.cell_height,
-                ],
-                size: [self.atlas.cell_width * cursor_width, self.atlas.cell_height],
+            let cell_position = [
+                self.settings.padding_x + cursor_column as f32 * self.atlas.cell_width,
+                self.settings.padding_y + row as f32 * self.atlas.cell_height,
+            ];
+            let (position, size) = cursor_geometry(
+                self.settings.cursor_style,
+                cell_position,
+                self.atlas.cell_width * cursor_width,
+                self.atlas.cell_height,
+            );
+            let mut color = self.settings.cursor;
+            if self.settings.cursor_style == CursorStyle::Block {
+                color[3] = 0.68;
+            }
+            instances.cursor.push(GlyphInstance {
+                position,
+                size,
                 uv_min: self.atlas.solid_uv_min,
                 uv_max: self.atlas.solid_uv_max,
-                color: CURSOR_COLOR,
+                color,
+                style: [0.0; 2],
             });
         }
 
@@ -616,11 +661,14 @@ impl Renderer {
             if cell.is_continuation() {
                 continue;
             }
-            let foreground = if cell.flags.inverse() {
-                cell.background
-            } else {
-                cell.foreground
-            };
+            let foreground = resolve_glyph_foreground(
+                cell,
+                selection_contains_cell(snapshot, row, column),
+                self.settings.foreground,
+                self.settings.background,
+                self.settings.selection_foreground,
+                &self.settings.ansi,
+            );
             let cell_width = self.atlas.cell_width;
             let cell_height = self.atlas.cell_height;
             let occupied_width = cell.width.columns() as f32 * cell_width;
@@ -647,7 +695,11 @@ impl Renderer {
                         size: [glyph.width, glyph.height],
                         uv_min: glyph.uv_min,
                         uv_max: glyph.uv_max,
-                        color: resolve_color(foreground, self.settings.foreground),
+                        color: style_color(foreground, cell.flags.dim()),
+                        style: [
+                            f32::from(cell.flags.bold()),
+                            if cell.flags.italic() { 0.16 } else { 0.0 },
+                        ],
                     });
                 }
             }
@@ -660,11 +712,11 @@ impl Renderer {
                     size: [occupied_width, 1.0],
                     uv_min: self.atlas.solid_uv_min,
                     uv_max: self.atlas.solid_uv_max,
-                    color: resolve_color(foreground, self.settings.foreground),
+                    color: style_color(foreground, cell.flags.dim()),
+                    style: [0.0; 2],
                 });
             }
         }
-        instances
     }
 
     fn upload_changed_instances(&mut self, dirty_rows: usize, total_rows: usize) {
@@ -804,11 +856,13 @@ impl Renderer {
 
     fn configure(&mut self, size: PhysicalSize<u32>) {
         if size.width == 0 || size.height == 0 {
+            self.surface_configured = false;
             return;
         }
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
+        self.surface_configured = true;
         let viewport = ViewportUniform {
             size: [size.width as f32, size.height as f32],
             padding: [0.0; 2],
@@ -818,14 +872,18 @@ impl Renderer {
     }
 }
 
-fn content_size(size: PhysicalSize<u32>, padding_x: f32, padding_y: f32) -> PhysicalSize<u32> {
+pub(crate) fn content_size(
+    size: PhysicalSize<u32>,
+    padding_x: f32,
+    padding_y: f32,
+) -> PhysicalSize<u32> {
     PhysicalSize::new(
         size.width.saturating_sub((padding_x * 2.0) as u32),
         size.height.saturating_sub((padding_y * 2.0) as u32),
     )
 }
 
-fn grid_size_for_metrics(
+pub(crate) fn grid_size_for_metrics(
     size: PhysicalSize<u32>,
     cell_width: f32,
     cell_height: f32,
@@ -839,32 +897,11 @@ fn grid_size_for_metrics(
     }
 }
 
-fn resolve_color(color: Color, default: [f32; 4]) -> [f32; 4] {
+fn resolve_color(color: Color, default: [f32; 4], ansi: &[[f32; 4]; 16]) -> [f32; 4] {
     match color {
         Color::Default => default,
         Color::Rgb(red, green, blue) => rgba(red, green, blue),
-        Color::Indexed(index) if index < 16 => {
-            const ANSI: [[u8; 3]; 16] = [
-                [0, 0, 0],
-                [205, 49, 49],
-                [13, 188, 121],
-                [229, 229, 16],
-                [36, 114, 200],
-                [188, 63, 188],
-                [17, 168, 205],
-                [229, 229, 229],
-                [102, 102, 102],
-                [241, 76, 76],
-                [35, 209, 139],
-                [245, 245, 67],
-                [59, 142, 234],
-                [214, 112, 214],
-                [41, 184, 219],
-                [255, 255, 255],
-            ];
-            let [red, green, blue] = ANSI[index as usize];
-            rgba(red, green, blue)
-        }
+        Color::Indexed(index) if index < 16 => ansi[index as usize],
         Color::Indexed(index) if index < 232 => {
             let index = index - 16;
             let component = |value: u8| if value == 0 { 0 } else { 55 + value * 40 };
@@ -881,6 +918,36 @@ fn resolve_color(color: Color, default: [f32; 4]) -> [f32; 4] {
     }
 }
 
+fn resolve_cell_colors(
+    cell: Cell,
+    default_foreground: [f32; 4],
+    default_background: [f32; 4],
+    ansi: &[[f32; 4]; 16],
+) -> ([f32; 4], [f32; 4]) {
+    let foreground = resolve_color(cell.foreground, default_foreground, ansi);
+    let background = resolve_color(cell.background, default_background, ansi);
+    if cell.flags.inverse() {
+        (background, foreground)
+    } else {
+        (foreground, background)
+    }
+}
+
+fn resolve_glyph_foreground(
+    cell: Cell,
+    selected: bool,
+    default_foreground: [f32; 4],
+    default_background: [f32; 4],
+    selection_foreground: [f32; 4],
+    ansi: &[[f32; 4]; 16],
+) -> [f32; 4] {
+    if selected {
+        selection_foreground
+    } else {
+        resolve_cell_colors(cell, default_foreground, default_background, ansi).0
+    }
+}
+
 fn wgpu_color(color: [f32; 4]) -> wgpu::Color {
     wgpu::Color {
         r: color[0] as f64,
@@ -890,13 +957,56 @@ fn wgpu_color(color: [f32; 4]) -> wgpu::Color {
     }
 }
 
+fn style_color(mut color: [f32; 4], dim: bool) -> [f32; 4] {
+    if dim {
+        color[0] *= 0.66;
+        color[1] *= 0.66;
+        color[2] *= 0.66;
+    }
+    color
+}
+
 fn rgba(red: u8, green: u8, blue: u8) -> [f32; 4] {
     [
-        red as f32 / 255.0,
-        green as f32 / 255.0,
-        blue as f32 / 255.0,
+        srgb_to_linear(red),
+        srgb_to_linear(green),
+        srgb_to_linear(blue),
         1.0,
     ]
+}
+
+fn selection_contains_cell(snapshot: RenderSnapshot<'_>, row: usize, column: usize) -> bool {
+    let Some(selection) = snapshot.selection else {
+        return false;
+    };
+    let cell = snapshot.cells[row * snapshot.columns + column];
+    selection.contains(row, column)
+        || (cell.is_continuation() && column > 0 && selection.contains(row, column - 1))
+        || (cell.width.columns() == 2
+            && column + 1 < snapshot.columns
+            && selection.contains(row, column + 1))
+}
+
+fn cursor_geometry(
+    style: CursorStyle,
+    position: [f32; 2],
+    width: f32,
+    height: f32,
+) -> ([f32; 2], [f32; 2]) {
+    match style {
+        CursorStyle::Block => (position, [width, height]),
+        CursorStyle::Beam => {
+            let thickness = (width * 0.16).clamp(2.0, 3.0).min(width);
+            (position, [thickness, height])
+        }
+        CursorStyle::Underline => {
+            let thickness = (height * 0.1).clamp(2.0, 3.0).min(height);
+            (
+                [position[0], position[1] + height - thickness],
+                [width, thickness],
+            )
+        }
+    }
 }
 
 fn create_instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
@@ -910,8 +1020,12 @@ fn create_instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffe
 
 #[cfg(test)]
 mod tests {
-    use super::{grid_size_for_metrics, resolve_color, rgba};
-    use crate::terminal::{Color, GridSize};
+    use super::{
+        cursor_geometry, grid_size_for_metrics, resolve_cell_colors, resolve_color,
+        resolve_glyph_foreground, rgba,
+    };
+    use crate::config::{Config, CursorStyle};
+    use crate::terminal::{Color, GridSize, Terminal, TerminalParser};
     use winit::dpi::PhysicalSize;
 
     #[test]
@@ -935,12 +1049,84 @@ mod tests {
     #[test]
     fn resolves_default_truecolor_and_color_cube_entries() {
         const DEFAULT: [f32; 4] = [0.9, 0.92, 0.96, 1.0];
-        assert_eq!(resolve_color(Color::Default, DEFAULT), DEFAULT);
-        assert_eq!(resolve_color(Color::Rgb(1, 2, 3), DEFAULT), rgba(1, 2, 3));
-        assert_eq!(resolve_color(Color::Indexed(16), DEFAULT), rgba(0, 0, 0));
+        let ansi = Config::default().visual_colors().unwrap().ansi;
+        assert_eq!(resolve_color(Color::Default, DEFAULT, &ansi), DEFAULT);
         assert_eq!(
-            resolve_color(Color::Indexed(231), DEFAULT),
+            resolve_color(Color::Rgb(1, 2, 3), DEFAULT, &ansi),
+            rgba(1, 2, 3)
+        );
+        assert_eq!(
+            resolve_color(Color::Indexed(16), DEFAULT, &ansi),
+            rgba(0, 0, 0)
+        );
+        assert_eq!(
+            resolve_color(Color::Indexed(231), DEFAULT, &ansi),
             rgba(255, 255, 255)
         );
+    }
+
+    #[test]
+    fn ansi_indices_resolve_from_the_flash_palette() {
+        let colors = Config::default().visual_colors().unwrap();
+        assert_eq!(
+            resolve_color(Color::Indexed(6), colors.foreground, &colors.ansi),
+            colors.ansi[6]
+        );
+        assert_ne!(colors.ansi[6], colors.ansi[14]);
+    }
+
+    #[test]
+    fn inverse_cells_swap_resolved_default_color_roles() {
+        const FOREGROUND: [f32; 4] = [0.9, 0.8, 0.7, 1.0];
+        const BACKGROUND: [f32; 4] = [0.1, 0.2, 0.3, 1.0];
+        let mut terminal = Terminal::new(1, 1);
+        TerminalParser::default().process(&mut terminal, b"\x1b[7mX");
+        let ansi = Config::default().visual_colors().unwrap().ansi;
+        assert_eq!(
+            resolve_cell_colors(
+                terminal.render_snapshot().cells[0],
+                FOREGROUND,
+                BACKGROUND,
+                &ansi
+            ),
+            (BACKGROUND, FOREGROUND)
+        );
+    }
+
+    #[test]
+    fn cursor_styles_have_balanced_cell_relative_geometry() {
+        assert_eq!(
+            cursor_geometry(CursorStyle::Block, [14.0, 12.0], 22.0, 24.0),
+            ([14.0, 12.0], [22.0, 24.0])
+        );
+        assert_eq!(
+            cursor_geometry(CursorStyle::Beam, [14.0, 12.0], 11.0, 24.0),
+            ([14.0, 12.0], [2.0, 24.0])
+        );
+        assert_eq!(
+            cursor_geometry(CursorStyle::Underline, [14.0, 12.0], 22.0, 24.0),
+            ([14.0, 33.6], [22.0, 2.4])
+        );
+    }
+
+    #[test]
+    fn selection_foreground_overrides_ansi_without_mutating_the_cell() {
+        let colors = Config::default().visual_colors().unwrap();
+        let mut terminal = Terminal::new(1, 1);
+        TerminalParser::default().process(&mut terminal, b"\x1b[31mX");
+        let cell = terminal.render_snapshot().cells[0];
+        assert_eq!(cell.foreground, Color::Indexed(1));
+        assert_eq!(
+            resolve_glyph_foreground(
+                cell,
+                true,
+                colors.foreground,
+                colors.background,
+                colors.selection_foreground,
+                &colors.ansi,
+            ),
+            colors.selection_foreground
+        );
+        assert_eq!(cell.foreground, Color::Indexed(1));
     }
 }

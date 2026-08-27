@@ -91,7 +91,7 @@ pub struct PtySession {
     master: Option<Box<dyn MasterPty + Send>>,
     child: Option<Box<dyn Child + Send + Sync>>,
     input_sender: Option<SyncSender<PtyInput>>,
-    events: Receiver<PtyEvent>,
+    events: Option<Receiver<PtyEvent>>,
     wake_pending: Arc<AtomicBool>,
     input_wake_pending: Arc<AtomicBool>,
     event_proxy: EventLoopProxy<AppEvent>,
@@ -148,6 +148,7 @@ impl PtySession {
             Ok(reader_thread) => reader_thread,
             Err(error) => {
                 let _ = child.kill();
+                let _ = child.wait();
                 return Err(error).context("could not start PTY reader thread");
             }
         };
@@ -174,6 +175,7 @@ impl PtySession {
                 let _ = child.kill();
                 drop(pair.master);
                 let _ = reader_thread.join();
+                let _ = child.wait();
                 return Err(error).context("could not start PTY writer thread");
             }
         };
@@ -184,7 +186,7 @@ impl PtySession {
             master: Some(pair.master),
             child: Some(child),
             input_sender: Some(input_sender),
-            events,
+            events: Some(events),
             wake_pending,
             input_wake_pending,
             event_proxy,
@@ -231,10 +233,13 @@ impl PtySession {
     /// The second receive after clearing the wake flag closes the race where a
     /// reader event arrives while the queue is being drained.
     pub fn drain_events(&self, mut handle: impl FnMut(PtyEvent)) -> DrainResult {
+        let Some(events) = self.events.as_ref() else {
+            return DrainResult::default();
+        };
         let started_at = Instant::now();
         let mut output_bytes = 0;
         loop {
-            while let Ok(event) = self.events.try_recv() {
+            while let Ok(event) = events.try_recv() {
                 output_bytes += event.output_byte_count();
                 handle(event);
                 if output_bytes >= OUTPUT_DRAIN_BYTE_BUDGET
@@ -248,7 +253,7 @@ impl PtySession {
             }
 
             self.wake_pending.store(false, Ordering::Release);
-            match self.events.try_recv() {
+            match events.try_recv() {
                 Ok(event) => handle(event),
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
                     return DrainResult::default();
@@ -272,6 +277,8 @@ impl Drop for PtySession {
             let _ = child.kill();
         }
 
+        // Disconnect blocked bounded-channel sends before joining either worker.
+        self.events.take();
         self.input_sender.take();
         if let Some(writer_thread) = self.writer_thread.take() {
             let _ = writer_thread.join();
@@ -280,6 +287,9 @@ impl Drop for PtySession {
 
         if let Some(reader_thread) = self.reader_thread.take() {
             let _ = reader_thread.join();
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.wait();
         }
     }
 }

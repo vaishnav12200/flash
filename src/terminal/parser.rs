@@ -1,6 +1,6 @@
 use vte::{Params, Perform};
 
-use super::{Color, Terminal};
+use super::{Color, MouseTracking, Terminal};
 
 #[derive(Default)]
 pub struct TerminalParser {
@@ -35,6 +35,12 @@ impl Perform for PerformerAdapter<'_> {
         }
     }
 
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if matches!(params.first(), Some(code) if *code == b"0" || *code == b"2") {
+            self.terminal.set_title(&params[1..]);
+        }
+    }
+
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
         if ignore {
             return;
@@ -65,7 +71,9 @@ impl Perform for PerformerAdapter<'_> {
                 self.terminal.render_snapshot().cursor.row,
                 first.saturating_sub(1) as usize,
             ),
-            'H' | 'f' => self.terminal.set_cursor(
+            'I' => self.terminal.tab_forward(first as usize),
+            'Z' => self.terminal.tab_backward(first as usize),
+            'H' | 'f' => self.terminal.set_cursor_address(
                 parameter_or(values, 0, 1).saturating_sub(1) as usize,
                 parameter_or(values, 1, 1).saturating_sub(1) as usize,
             ),
@@ -91,8 +99,11 @@ impl Perform for PerformerAdapter<'_> {
                     self.terminal.set_scroll_region(top, bottom);
                 }
             }
+            'g' if !private => self.terminal.clear_tab_stop(parameter_or(values, 0, 0)),
             's' => self.terminal.save_cursor(),
             'u' => self.terminal.restore_cursor(),
+            'h' if !private => set_ansi_modes(self.terminal, values, true),
+            'l' if !private => set_ansi_modes(self.terminal, values, false),
             'h' if private => set_private_modes(self.terminal, values, true),
             'l' if private => set_private_modes(self.terminal, values, false),
             _ => {}
@@ -106,6 +117,9 @@ impl Perform for PerformerAdapter<'_> {
         match byte {
             b'7' => self.terminal.save_cursor(),
             b'8' => self.terminal.restore_cursor(),
+            b'H' => self.terminal.set_tab_stop(),
+            b'=' => self.terminal.set_application_keypad(true),
+            b'>' => self.terminal.set_application_keypad(false),
             b'D' => self.terminal.line_feed(),
             b'E' => {
                 self.terminal.line_feed();
@@ -128,20 +142,35 @@ fn parameter_or(values: &[u16], index: usize, default: u16) -> u16 {
 fn set_private_modes(terminal: &mut Terminal, values: &[u16], enabled: bool) {
     for value in values {
         match value {
+            1 => terminal.set_application_cursor_keys(enabled),
+            6 => terminal.set_origin_mode(enabled),
             7 => terminal.set_auto_wrap(enabled),
             25 => terminal.set_cursor_visible(enabled),
-            47 | 1047 => terminal.use_alternate_screen(enabled, enabled),
+            1000 => terminal.set_mouse_tracking(MouseTracking::Button, enabled),
+            1002 => terminal.set_mouse_tracking(MouseTracking::ButtonMotion, enabled),
+            1003 => terminal.set_mouse_tracking(MouseTracking::AnyMotion, enabled),
+            1006 => terminal.set_sgr_mouse(enabled),
+            47 => terminal.use_alternate_screen(enabled, false),
+            1047 => terminal.use_alternate_screen(enabled, enabled),
             1049 => {
-                if enabled {
+                if enabled && !terminal.alternate_screen_active() {
                     terminal.save_cursor();
-                }
-                terminal.use_alternate_screen(enabled, enabled);
-                if !enabled {
+                    terminal.use_alternate_screen(true, true);
+                } else if !enabled && terminal.alternate_screen_active() {
+                    terminal.use_alternate_screen(false, false);
                     terminal.restore_cursor();
                 }
             }
             2004 => terminal.set_bracketed_paste(enabled),
             _ => {}
+        }
+    }
+}
+
+fn set_ansi_modes(terminal: &mut Terminal, values: &[u16], enabled: bool) {
+    for value in values {
+        if *value == 4 {
+            terminal.set_insert_mode(enabled);
         }
     }
 }
@@ -153,10 +182,14 @@ fn apply_sgr(terminal: &mut Terminal, values: &[u16]) {
         match values[index] {
             0 => terminal.reset_attributes(),
             1 => terminal.set_bold(true),
+            2 => terminal.set_dim(true),
             3 => terminal.set_italic(true),
             4 => terminal.set_underline(true),
             7 => terminal.set_inverse(true),
-            22 => terminal.set_bold(false),
+            22 => {
+                terminal.set_bold(false);
+                terminal.set_dim(false);
+            }
             23 => terminal.set_italic(false),
             24 => terminal.set_underline(false),
             27 => terminal.set_inverse(false),
@@ -223,6 +256,31 @@ mod tests {
     }
 
     #[test]
+    fn redundant_alternate_screen_reset_does_not_restore_an_unrelated_cursor() {
+        let mut parser = TerminalParser::default();
+        let mut terminal = Terminal::new(2, 3);
+        parser.process(&mut terminal, b"\x1b[2;2H\x1b[?1049l");
+        assert_eq!(
+            terminal.render_snapshot().cursor,
+            crate::terminal::Cursor { row: 1, column: 1 }
+        );
+    }
+
+    #[test]
+    fn dec_save_restore_recovers_cursor_attributes_and_modes() {
+        let mut parser = TerminalParser::default();
+        let mut terminal = Terminal::new(2, 3);
+        parser.process(
+            &mut terminal,
+            b"\x1b[2;2H\x1b[31;1m\x1b7\x1b[1;1H\x1b[0m\x1b[?7l\x1b8X",
+        );
+        let snapshot = terminal.render_snapshot();
+        assert_eq!(snapshot.cells[4].character, 'X');
+        assert_eq!(snapshot.cells[4].foreground, Color::Indexed(1));
+        assert!(snapshot.cells[4].flags.bold());
+    }
+
+    #[test]
     fn parses_private_cursor_visibility_mode() {
         let mut parser = TerminalParser::default();
         let mut terminal = Terminal::new(1, 1);
@@ -257,5 +315,160 @@ mod tests {
             snapshot.cells[2].width,
             crate::terminal::CellWidth::Continuation
         );
+    }
+
+    #[test]
+    fn parses_fragmented_csi_exactly_like_a_contiguous_sequence() {
+        let mut fragmented_parser = TerminalParser::default();
+        let mut fragmented = Terminal::new(1, 2);
+        for chunk in [
+            &b"\x1b["[..],
+            &b"3"[..],
+            &b"8;2;"[..],
+            &b"255;0;0"[..],
+            &b"mX"[..],
+        ] {
+            fragmented_parser.process(&mut fragmented, chunk);
+        }
+
+        let mut contiguous_parser = TerminalParser::default();
+        let mut contiguous = Terminal::new(1, 2);
+        contiguous_parser.process(&mut contiguous, b"\x1b[38;2;255;0;0mX");
+        assert_eq!(
+            fragmented.render_snapshot().cells,
+            contiguous.render_snapshot().cells
+        );
+        assert_eq!(
+            fragmented.render_snapshot().cells[0].foreground,
+            Color::Rgb(255, 0, 0)
+        );
+    }
+
+    #[test]
+    fn incomplete_malformed_and_oversized_sequences_remain_bounded() {
+        let mut parser = TerminalParser::default();
+        let mut terminal = Terminal::new(2, 3);
+        parser.process(&mut terminal, b"A\x1b[");
+        assert_eq!(terminal.render_snapshot().cells[0].character, 'A');
+        parser.process(
+            &mut terminal,
+            b"999999999999999999999999999999999999999999;1H",
+        );
+        assert_eq!(
+            terminal.render_snapshot().cursor,
+            crate::terminal::Cursor { row: 1, column: 0 }
+        );
+        let cursor = terminal.render_snapshot().cursor;
+        parser.process(
+            &mut terminal,
+            b"\x1b[1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17;18;19;20;21;22;23;24;25;26;27;28;29;30;31;32;33H",
+        );
+        assert_eq!(terminal.render_snapshot().cursor, cursor);
+        parser.process(&mut terminal, b"\x1b[?9999hB");
+        assert_eq!(terminal.render_snapshot().cells[3].character, 'B');
+    }
+
+    #[test]
+    fn parses_application_cursor_and_mouse_modes() {
+        let mut parser = TerminalParser::default();
+        let mut terminal = Terminal::new(1, 1);
+        parser.process(&mut terminal, b"\x1b[?1;1002;1006h");
+        assert!(terminal.application_cursor_keys());
+        assert_eq!(
+            terminal.mouse_tracking(),
+            crate::terminal::MouseTracking::ButtonMotion
+        );
+        assert!(terminal.sgr_mouse());
+        parser.process(&mut terminal, b"\x1b[?1;1002;1006l");
+        assert!(!terminal.application_cursor_keys());
+        assert_eq!(
+            terminal.mouse_tracking(),
+            crate::terminal::MouseTracking::None
+        );
+        assert!(!terminal.sgr_mouse());
+    }
+
+    #[test]
+    fn sgr_styles_and_extended_colors_do_not_leak_after_reset() {
+        let mut parser = TerminalParser::default();
+        let mut terminal = Terminal::new(1, 3);
+        parser.process(
+            &mut terminal,
+            b"\x1b[1;2;3;4;7;38;5;200;48;2;1;2;3mX\x1b[0mY",
+        );
+        let cells = terminal.render_snapshot().cells;
+        assert!(cells[0].flags.bold());
+        assert!(cells[0].flags.dim());
+        assert!(cells[0].flags.italic());
+        assert!(cells[0].flags.underline());
+        assert!(cells[0].flags.inverse());
+        assert_eq!(cells[0].foreground, Color::Indexed(200));
+        assert_eq!(cells[0].background, Color::Rgb(1, 2, 3));
+        assert_eq!(cells[1].foreground, Color::Default);
+        assert_eq!(cells[1].background, Color::Default);
+        assert_eq!(cells[1].flags, crate::terminal::CellFlags::default());
+    }
+
+    #[test]
+    fn insert_mode_shifts_existing_cells() {
+        let mut parser = TerminalParser::default();
+        let mut terminal = Terminal::new(1, 5);
+        parser.process(&mut terminal, b"ABC\x1b[2G\x1b[4hX\x1b[4l");
+        let text: String = terminal.render_snapshot().cells[..4]
+            .iter()
+            .map(|cell| cell.character)
+            .collect();
+        assert_eq!(text, "AXBC");
+    }
+
+    #[test]
+    fn origin_mode_addresses_and_clamps_within_scroll_margins() {
+        let mut parser = TerminalParser::default();
+        let mut terminal = Terminal::new(5, 4);
+        parser.process(&mut terminal, b"\x1b[2;4r\x1b[?6h\x1b[1;1H\x1b[20AZ");
+        assert_eq!(terminal.render_snapshot().cursor.row, 1);
+        assert_eq!(terminal.render_snapshot().cells[4].character, 'Z');
+        parser.process(&mut terminal, b"\x1b[?6l");
+        assert_eq!(
+            terminal.render_snapshot().cursor,
+            crate::terminal::Cursor::default()
+        );
+    }
+
+    #[test]
+    fn tab_stop_controls_replace_the_default_stops() {
+        let mut parser = TerminalParser::default();
+        let mut terminal = Terminal::new(1, 12);
+        parser.process(&mut terminal, b"\x1b[3g\x1b[4G\x1bH\r\tX");
+        assert_eq!(terminal.render_snapshot().cells[3].character, 'X');
+
+        parser.process(&mut terminal, b"\x1b[12G\x1b[2ZY");
+        assert_eq!(terminal.render_snapshot().cells[0].character, 'Y');
+    }
+
+    #[test]
+    fn parses_application_keypad_mode() {
+        let mut parser = TerminalParser::default();
+        let mut terminal = Terminal::new(1, 1);
+        parser.process(&mut terminal, b"\x1b=");
+        assert!(terminal.application_keypad());
+        parser.process(&mut terminal, b"\x1b>");
+        assert!(!terminal.application_keypad());
+    }
+
+    #[test]
+    fn parses_fragmented_bounded_window_titles() {
+        let mut parser = TerminalParser::default();
+        let mut terminal = Terminal::new(1, 1);
+        parser.process(&mut terminal, b"\x1b]2;Flash");
+        parser.process(&mut terminal, b"; audit\x07");
+        assert_eq!(terminal.title(), "Flash; audit");
+        let version = terminal.title_version();
+        parser.process(&mut terminal, b"\x1b]2;Flash; audit\x07");
+        assert_eq!(terminal.title_version(), version);
+
+        let oversized = format!("\x1b]2;{}\x07", "x".repeat(2048));
+        parser.process(&mut terminal, oversized.as_bytes());
+        assert!(terminal.title().len() <= 1024);
     }
 }

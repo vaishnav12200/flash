@@ -14,12 +14,14 @@ struct VertexInput {
     @location(2) uv_min: vec2<f32>,
     @location(3) uv_max: vec2<f32>,
     @location(4) color: vec4<f32>,
+    @location(5) style: vec2<f32>,
 };
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) bold: f32,
 };
 
 @vertex
@@ -29,7 +31,8 @@ fn vertex_main(input: VertexInput) -> VertexOutput {
         vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(1.0, 1.0),
     );
     let corner = corners[input.vertex_index];
-    let pixel = input.position + corner * input.size;
+    let italic_offset = input.style.y * input.size.y * (1.0 - corner.y);
+    let pixel = input.position + corner * input.size + vec2(italic_offset, 0.0);
     let clip = vec2(
         pixel.x / viewport.size.x * 2.0 - 1.0,
         1.0 - pixel.y / viewport.size.y * 2.0,
@@ -39,11 +42,16 @@ fn vertex_main(input: VertexInput) -> VertexOutput {
     output.position = vec4(clip, 0.0, 1.0);
     output.uv = mix(input.uv_min, input.uv_max, corner);
     output.color = input.color;
+    output.bold = input.style.x;
     return output;
 }
 
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let coverage = textureSample(glyph_atlas, glyph_sampler, input.uv).r;
+    var coverage = textureSample(glyph_atlas, glyph_sampler, input.uv).r;
+    if input.bold > 0.5 {
+        let texel = 1.0 / vec2<f32>(textureDimensions(glyph_atlas));
+        coverage = max(coverage, textureSample(glyph_atlas, glyph_sampler, input.uv - vec2(texel.x, 0.0)).r);
+    }
     return vec4(input.color.rgb, input.color.a * coverage);
 }

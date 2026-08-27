@@ -15,12 +15,13 @@ use winit::{
 };
 
 use crate::{
-    config::{Config, ShortcutAction, ShortcutMap, parse_color},
+    config::{Config, ShortcutAction, ShortcutMap},
     event::AppEvent,
+    font::GlyphAtlas,
     input,
     pty::{self, InputEnqueueError, PtyDimensions, PtyEvent, PtyInput, PtySession},
     renderer::{RenderError, RenderOutcome, Renderer, RendererSettings},
-    terminal::{Terminal, TerminalParser},
+    terminal::{MouseTracking, Terminal, TerminalParser},
 };
 
 const INITIAL_WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize::new(960, 600);
@@ -30,7 +31,7 @@ const MIN_FONT_SIZE: f32 = 6.0;
 const MAX_FONT_SIZE: f32 = 72.0;
 const MAX_PENDING_INPUT_BYTES: usize = 8 * 1024 * 1024;
 const INITIAL_FRAME_DEADLINE: Duration = Duration::from_millis(100);
-const LATENCY_BUCKET_UPPER_US: [u64; 16] = [
+const LATENCY_BUCKET_UPPER_US: [u64; 19] = [
     250,
     500,
     750,
@@ -46,6 +47,9 @@ const LATENCY_BUCKET_UPPER_US: [u64; 16] = [
     33_000,
     100_000,
     500_000,
+    1_000_000,
+    5_000_000,
+    10_000_000,
     u64::MAX,
 ];
 
@@ -55,6 +59,7 @@ pub struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     pty: Option<PtySession>,
+    pty_dimensions: Option<PtyDimensions>,
     terminal: Terminal,
     terminal_parser: TerminalParser,
     window_size: PhysicalSize<u32>,
@@ -65,6 +70,7 @@ pub struct App {
     clipboard: Option<arboard::Clipboard>,
     cursor_position: PhysicalPosition<f64>,
     selecting: bool,
+    reported_mouse_button: Option<u8>,
     logical_font_size: f32,
     latency: LatencyTracker,
     pending_input: VecDeque<PendingInput>,
@@ -74,6 +80,8 @@ pub struct App {
     window_visible: bool,
     initial_frame_deadline_reached: bool,
     input_latency_probe_pending: bool,
+    surface_timeout_retries: u8,
+    title_version: u64,
 }
 
 struct PendingInput {
@@ -203,6 +211,7 @@ impl App {
             window: None,
             renderer: None,
             pty: None,
+            pty_dimensions: None,
             terminal,
             terminal_parser: TerminalParser::default(),
             window_size: INITIAL_WINDOW_SIZE,
@@ -214,6 +223,7 @@ impl App {
             clipboard,
             cursor_position: PhysicalPosition::new(0.0, 0.0),
             selecting: false,
+            reported_mouse_button: None,
             latency: LatencyTracker::new(startup_started_at),
             pending_input: VecDeque::new(),
             pending_input_bytes: 0,
@@ -223,6 +233,8 @@ impl App {
             initial_frame_deadline_reached: false,
             input_latency_probe_pending: std::env::var_os("FLASH_INPUT_LATENCY_PROBE")
                 .is_some_and(|value| value == "1"),
+            surface_timeout_retries: 0,
+            title_version: 0,
         }
     }
 
@@ -237,6 +249,9 @@ impl App {
     }
 
     fn desired_pty_dimensions(&self) -> Option<PtyDimensions> {
+        if self.window_size.width == 0 || self.window_size.height == 0 {
+            return None;
+        }
         let renderer = self.renderer.as_ref()?;
         let content = renderer.content_size(self.window_size);
         Some(PtyDimensions {
@@ -250,21 +265,27 @@ impl App {
         let Some(dimensions) = self.desired_pty_dimensions() else {
             return;
         };
-        if !self.terminal.resize(dimensions.grid) {
+        let grid_changed = self.terminal.resize(dimensions.grid);
+        if !grid_changed && self.pty_dimensions == Some(dimensions) {
             return;
         }
 
-        tracing::info!(
-            rows = dimensions.grid.rows,
-            columns = dimensions.grid.columns,
-            pixel_width = dimensions.pixel_width,
-            pixel_height = dimensions.pixel_height,
-            "terminal grid resized"
-        );
-        if let Some(pty) = self.pty.as_ref()
-            && let Err(error) = pty.resize(dimensions)
-        {
-            tracing::error!(%error, "failed to propagate terminal size to PTY");
+        if grid_changed {
+            tracing::info!(
+                rows = dimensions.grid.rows,
+                columns = dimensions.grid.columns,
+                pixel_width = dimensions.pixel_width,
+                pixel_height = dimensions.pixel_height,
+                "terminal grid resized"
+            );
+        }
+        if let Some(pty) = self.pty.as_ref() {
+            match pty.resize(dimensions) {
+                Ok(()) => self.pty_dimensions = Some(dimensions),
+                Err(error) => {
+                    tracing::error!(%error, "failed to propagate terminal size to PTY");
+                }
+            }
         }
     }
 
@@ -323,6 +344,22 @@ impl App {
             let process_started_at = Instant::now();
             self.terminal_parser
                 .process(&mut self.terminal, &self.pty_output_batch);
+            if self.terminal.mouse_tracking() == MouseTracking::None {
+                self.reported_mouse_button = None;
+            } else {
+                self.selecting = false;
+            }
+            if self.title_version != self.terminal.title_version() {
+                let title = self.terminal.title();
+                self.window()
+                    .expect("window exists while processing PTY output")
+                    .set_title(if title.is_empty() {
+                        WINDOW_TITLE
+                    } else {
+                        title
+                    });
+                self.title_version = self.terminal.title_version();
+            }
             tracing::debug!(
                 byte_count = self.pty_output_batch.len(),
                 parse_us = process_started_at.elapsed().as_micros(),
@@ -421,7 +458,12 @@ impl App {
             self.handle_shortcut(action);
             return;
         }
-        let Some(bytes) = input::encode_key(&event, self.modifiers) else {
+        let Some(bytes) = input::encode_key(
+            &event,
+            self.modifiers,
+            self.terminal.application_cursor_keys(),
+            self.terminal.application_keypad(),
+        ) else {
             return;
         };
         self.latency
@@ -506,6 +548,38 @@ impl App {
             .as_ref()?
             .cell_at(self.cursor_position, self.terminal.size())
     }
+
+    fn mouse_reporting_active(&self) -> bool {
+        should_report_mouse(self.terminal.mouse_tracking(), self.modifiers.shift_key())
+    }
+
+    fn report_mouse(&mut self, kind: input::MouseEventKind) {
+        let Some(cell) = self.pointer_cell() else {
+            return;
+        };
+        if let Some(bytes) = input::encode_mouse(
+            kind,
+            cell.row,
+            cell.column,
+            self.modifiers,
+            self.terminal.sgr_mouse(),
+        ) {
+            self.write_pty(bytes);
+        }
+    }
+
+    fn mouse_button_code(button: MouseButton) -> Option<u8> {
+        match button {
+            MouseButton::Left => Some(0),
+            MouseButton::Middle => Some(1),
+            MouseButton::Right => Some(2),
+            _ => None,
+        }
+    }
+}
+
+fn should_report_mouse(mouse_tracking: MouseTracking, shift_override: bool) -> bool {
+    mouse_tracking != MouseTracking::None && !shift_override
 }
 
 impl ApplicationHandler<AppEvent> for App {
@@ -542,13 +616,71 @@ impl ApplicationHandler<AppEvent> for App {
             "latency.window_created"
         );
 
-        let provisional_dimensions = PtyDimensions {
-            grid: self.terminal.size(),
-            pixel_width: self.window_size.width,
-            pixel_height: self.window_size.height,
+        let visual_colors = self
+            .config
+            .visual_colors()
+            .expect("loaded configuration has valid visual colors");
+        let physical_scale = self.scale_factor as f32;
+        let mut selection_background = visual_colors.selection_background;
+        selection_background[3] = 0.72;
+        let renderer_settings = RendererSettings {
+            font_path: self.config.font.path.clone(),
+            fallback_font_paths: self.config.font.fallback.clone(),
+            font_size: self.logical_font_size,
+            padding_x: self.config.window.padding_x * physical_scale,
+            padding_y: self.config.window.padding_y * physical_scale,
+            foreground: visual_colors.foreground,
+            background: visual_colors.background,
+            cursor: visual_colors.cursor,
+            cursor_style: self.config.cursor.style,
+            selection_background,
+            selection_foreground: visual_colors.selection_foreground,
+            ansi: visual_colors.ansi,
         };
-        match PtySession::spawn(self.event_proxy.clone(), provisional_dimensions) {
-            Ok(pty) => self.pty = Some(pty),
+        let atlas = match GlyphAtlas::load(
+            &renderer_settings.font_path,
+            &renderer_settings.fallback_font_paths,
+            renderer_settings.font_size,
+            self.scale_factor,
+            Some(self.event_proxy.clone()),
+        ) {
+            Ok(atlas) => atlas,
+            Err(error) => {
+                tracing::error!(%error, "failed to initialize font atlas");
+                event_loop.exit();
+                return;
+            }
+        };
+        let content = crate::renderer::content_size(
+            self.window_size,
+            renderer_settings.padding_x,
+            renderer_settings.padding_y,
+        );
+        let grid = crate::renderer::grid_size_for_metrics(
+            self.window_size,
+            atlas.cell_width,
+            atlas.cell_height,
+            renderer_settings.padding_x,
+            renderer_settings.padding_y,
+        );
+        self.terminal.resize(grid);
+        tracing::info!(
+            rows = grid.rows,
+            columns = grid.columns,
+            pixel_width = content.width,
+            pixel_height = content.height,
+            "initial terminal grid measured"
+        );
+        let dimensions = PtyDimensions {
+            grid,
+            pixel_width: content.width,
+            pixel_height: content.height,
+        };
+        match PtySession::spawn(self.event_proxy.clone(), dimensions) {
+            Ok(pty) => {
+                self.pty = Some(pty);
+                self.pty_dimensions = Some(dimensions);
+            }
             Err(error) => {
                 tracing::error!(%error, "failed to initialize PTY session");
                 event_loop.exit();
@@ -566,23 +698,13 @@ impl ApplicationHandler<AppEvent> for App {
             let _ = deadline_proxy.send_event(AppEvent::InitialFrameDeadline);
         });
 
-        let renderer_settings = RendererSettings {
-            font_path: self.config.font.path.clone(),
-            fallback_font_paths: self.config.font.fallback.clone(),
-            font_size: self.logical_font_size,
-            padding_x: self.config.window.padding_x,
-            padding_y: self.config.window.padding_y,
-            foreground: parse_color(&self.config.window.foreground)
-                .expect("loaded configuration has a valid foreground color"),
-            background: parse_color(&self.config.window.background)
-                .expect("loaded configuration has a valid background color"),
-        };
         match pollster::block_on(Renderer::new(
             Arc::clone(&window),
             self.window_size,
             self.scale_factor,
             self.event_proxy.clone(),
             renderer_settings,
+            atlas,
         )) {
             Ok(renderer) => self.renderer = Some(renderer),
             Err(error) => {
@@ -595,7 +717,6 @@ impl ApplicationHandler<AppEvent> for App {
             startup_to_renderer_us = self.latency.startup_started_at.elapsed().as_micros(),
             "latency.renderer_ready"
         );
-
         self.synchronize_terminal_size();
         self.window = Some(window);
     }
@@ -618,6 +739,14 @@ impl ApplicationHandler<AppEvent> for App {
                 self.drain_pty_events(event_loop);
                 self.initial_frame_deadline_reached = true;
                 if !self.window_visible
+                    && let Some(window) = self.window()
+                {
+                    window.request_redraw();
+                }
+            }
+            AppEvent::RedrawRetry => {
+                if self.window_size.width > 0
+                    && self.window_size.height > 0
                     && let Some(window) = self.window()
                 {
                     window.request_redraw();
@@ -691,7 +820,18 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::KeyboardInput { event, .. } => self.forward_keyboard_input(event),
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_position = position;
-                if self.selecting
+                let motion_button = match self.terminal.mouse_tracking() {
+                    MouseTracking::AnyMotion if self.mouse_reporting_active() => {
+                        Some(self.reported_mouse_button.unwrap_or(3))
+                    }
+                    MouseTracking::ButtonMotion if self.mouse_reporting_active() => {
+                        self.reported_mouse_button
+                    }
+                    _ => None,
+                };
+                if let Some(button) = motion_button {
+                    self.report_mouse(input::MouseEventKind::Motion(button));
+                } else if self.selecting
                     && let Some(cell) = self.pointer_cell()
                 {
                     self.terminal.update_selection(cell);
@@ -700,26 +840,71 @@ impl ApplicationHandler<AppEvent> for App {
                         .request_redraw();
                 }
             }
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => match state {
-                ElementState::Pressed => {
-                    if let Some(cell) = self.pointer_cell() {
-                        self.terminal.begin_selection(cell);
-                        self.selecting = true;
-                    } else {
-                        self.terminal.clear_selection();
-                        self.selecting = false;
+            WindowEvent::MouseInput { state, button, .. } => {
+                let button_code = Self::mouse_button_code(button);
+                if self.mouse_reporting_active() {
+                    if let Some(button) = button_code {
+                        match state {
+                            ElementState::Pressed => {
+                                self.reported_mouse_button = Some(button);
+                                self.report_mouse(input::MouseEventKind::Press(button));
+                            }
+                            ElementState::Released => {
+                                self.report_mouse(input::MouseEventKind::Release(button));
+                                if self.reported_mouse_button == Some(button) {
+                                    self.reported_mouse_button = None;
+                                }
+                            }
+                        }
                     }
-                    self.window()
-                        .expect("window was validated above")
-                        .request_redraw();
+                    return;
                 }
-                ElementState::Released => self.selecting = false,
-            },
+
+                if state == ElementState::Released {
+                    self.reported_mouse_button = None;
+                }
+
+                if button != MouseButton::Left {
+                    return;
+                }
+                match state {
+                    ElementState::Pressed => {
+                        if let Some(cell) = self.pointer_cell() {
+                            self.terminal.begin_selection(cell);
+                            self.selecting = true;
+                        } else {
+                            self.terminal.clear_selection();
+                            self.selecting = false;
+                        }
+                        self.window()
+                            .expect("window was validated above")
+                            .request_redraw();
+                    }
+                    ElementState::Released => self.selecting = false,
+                }
+            }
             WindowEvent::MouseWheel { delta, .. } => {
+                if self.mouse_reporting_active() {
+                    let kind = match delta {
+                        MouseScrollDelta::LineDelta(_, vertical) if vertical > 0.0 => {
+                            Some(input::MouseEventKind::WheelUp)
+                        }
+                        MouseScrollDelta::LineDelta(_, vertical) if vertical < 0.0 => {
+                            Some(input::MouseEventKind::WheelDown)
+                        }
+                        MouseScrollDelta::PixelDelta(position) if position.y > 0.0 => {
+                            Some(input::MouseEventKind::WheelUp)
+                        }
+                        MouseScrollDelta::PixelDelta(position) if position.y < 0.0 => {
+                            Some(input::MouseEventKind::WheelDown)
+                        }
+                        _ => None,
+                    };
+                    if let Some(kind) = kind {
+                        self.report_mouse(kind);
+                    }
+                    return;
+                }
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, vertical) => (vertical * 3.0).round() as isize,
                     MouseScrollDelta::PixelDelta(position) => position.y.signum() as isize * 3,
@@ -742,6 +927,7 @@ impl ApplicationHandler<AppEvent> for App {
                 let render_started_at = Instant::now();
                 match renderer.render(self.terminal.render_snapshot()) {
                     Ok(RenderOutcome::Presented) => {
+                        self.surface_timeout_retries = 0;
                         let presented_at = Instant::now();
                         let render_us = presented_at.duration_since(render_started_at).as_micros();
                         self.latency.render_latency.record(render_us);
@@ -853,6 +1039,21 @@ impl ApplicationHandler<AppEvent> for App {
                         .window()
                         .expect("window was validated above")
                         .request_redraw(),
+                    Ok(RenderOutcome::Skipped) => {}
+                    Ok(RenderOutcome::TimedOut) => {
+                        if self.surface_timeout_retries < 3 {
+                            self.surface_timeout_retries += 1;
+                            let retry_proxy = self.event_proxy.clone();
+                            thread::spawn(move || {
+                                thread::sleep(Duration::from_millis(16));
+                                let _ = retry_proxy.send_event(AppEvent::RedrawRetry);
+                            });
+                        } else {
+                            tracing::warn!(
+                                "GPU surface timed out repeatedly; waiting for the next event"
+                            );
+                        }
+                    }
                     Err(RenderError::OutOfMemory) => {
                         tracing::error!("GPU ran out of memory; exiting");
                         event_loop.exit();
@@ -873,8 +1074,9 @@ impl ApplicationHandler<AppEvent> for App {
 mod tests {
     use std::{sync::Arc, time::Instant};
 
-    use super::{LatencyHistogram, PendingInput};
+    use super::{LatencyHistogram, PendingInput, should_report_mouse};
     use crate::pty::INPUT_CHUNK_SIZE;
+    use crate::terminal::MouseTracking;
 
     #[test]
     fn large_input_hits_bounded_channel_backpressure_without_blocking() {
@@ -905,5 +1107,21 @@ mod tests {
         assert_eq!(histogram.percentile_upper_us(95), 100_000);
         histogram.clear();
         assert_eq!(histogram.percentile_upper_us(95), 0);
+    }
+
+    #[test]
+    fn latency_histogram_reports_slow_startup_without_leaking_overflow_sentinel() {
+        let mut histogram = LatencyHistogram::default();
+        histogram.record(503_900);
+        assert_eq!(histogram.percentile_upper_us(95), 1_000_000);
+    }
+
+    #[test]
+    fn mouse_reporting_route_is_disabled_for_normal_shell_and_shift_override() {
+        assert!(!should_report_mouse(MouseTracking::None, false));
+        assert!(should_report_mouse(MouseTracking::Button, false));
+        assert!(should_report_mouse(MouseTracking::ButtonMotion, false));
+        assert!(should_report_mouse(MouseTracking::AnyMotion, false));
+        assert!(!should_report_mouse(MouseTracking::Button, true));
     }
 }

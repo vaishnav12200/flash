@@ -4,7 +4,7 @@
 
 Flash is an early-stage terminal emulator project focused on **low input latency**, **fast startup**, **low memory overhead**, and **correct terminal behavior**. It will connect a real user shell to a Linux pseudo-terminal (PTY), interpret ANSI/VT output into a terminal grid, and render that grid through a GPU pipeline.
 
-> **Project status: Phase 9 implemented, awaiting review.** Flash now has repeatable parser/allocation benchmarks, measured startup and PTY-to-present diagnostics, batched parsing and input storage, dirty-row renderer caches, partial GPU uploads, and input-to-present latency measurement.
+> **Project status: Phases 1–9 implemented and technically audited; visual-polish pass complete.** Flash has a restrained native visual system while retaining its measured dirty-row rendering, partial GPU uploads, bounded queues, and event-driven idle behavior. No later roadmap phase has started.
 
 ## Goals
 
@@ -159,10 +159,34 @@ fallback = []
 size = 18.0
 
 [window]
-padding_x = 8.0
-padding_y = 8.0
-foreground = "#E6EBF5"
-background = "#090A0E"
+padding_x = 14.0
+padding_y = 12.0
+
+[colors]
+background = "#0B0F14"
+foreground = "#DCE3EA"
+cursor = "#4CC9F0"
+selection_background = "#264F63"
+selection_foreground = "#F4F7FA"
+black = "#1B232D"
+red = "#D96868"
+green = "#7BC98C"
+yellow = "#D6B86A"
+blue = "#6FA8DC"
+magenta = "#B48ECA"
+cyan = "#56B6C2"
+white = "#C7D0D9"
+bright_black = "#5C6773"
+bright_red = "#E47B7B"
+bright_green = "#91D39E"
+bright_yellow = "#E0C47A"
+bright_blue = "#82B9E8"
+bright_magenta = "#C39BD3"
+bright_cyan = "#6CCAD2"
+bright_white = "#EEF3F7"
+
+[cursor]
+style = "block" # block, beam, or underline
 
 [scrollback]
 lines = 10000
@@ -178,7 +202,9 @@ scroll_page_down = "Shift+PageDown"
 scroll_to_bottom = "Ctrl+Shift+End"
 ```
 
-Colors use `#RRGGBB`. Font size is restricted to `6..=72`, padding must be non-negative, and scrollback is capped at one million lines. Invalid files produce field-specific diagnostics and Flash safely falls back to defaults for that launch.
+Colors use `#RRGGBB` sRGB values and are converted to the GPU surface's linear working space, so configured values appear as authored. The legacy `window.foreground` and `window.background` keys remain accepted and override their `[colors]` equivalents. Font size is restricted to `6..=72`, padding is specified in logical pixels and must be non-negative, and scrollback is capped at one million lines. Invalid files produce field-specific diagnostics and Flash safely falls back to defaults for that launch.
+
+Cursor blinking and window opacity are deliberately not implemented. Flash remains opaque, and the cursor remains event-driven, avoiding compositor-specific transparency behavior and idle redraw timers.
 
 `font.fallback` is an optional ordered list of font files. Flash tries the configured primary face first, then configured fallback faces, then a character-specific system face reported by Fontconfig. Missing faces are parsed on a bounded background loader instead of the render thread; a replacement glyph is shown until the requested face is ready. Unicode glyphs are rasterized lazily into a bounded texture atlas.
 
@@ -186,7 +212,7 @@ Normal terminal input remains distinct from shortcuts: plain `Ctrl+C` sends the 
 
 ## Compatibility and Security
 
-`TERM` is a compatibility contract. Flash will not advertise terminal features it does not implement, and a matching terminfo strategy will be decided as ANSI/VT support becomes concrete.
+`TERM` is a compatibility contract. Flash currently uses `xterm-256color` as a pragmatic compatibility baseline for the implemented common VT/xterm subset and identifies itself separately through `TERM_PROGRAM=flash`. A dedicated Flash terminfo entry remains future compatibility work; applications must not assume Flash implements every private xterm extension.
 
 Terminal output is untrusted input. The implementation will bound string-based escape-sequence payloads, fuzz parser/state transitions, avoid unbounded caches, and handle malformed output without panics. Sensitive protocols—including OSC 52 clipboard requests and hyperlink activation—will be conservative and configurable.
 
@@ -212,7 +238,7 @@ Useful Linux tools include `/usr/bin/time -v`, `hyperfine`, `perf`, flamegraph t
 
 Set `RUST_LOG=flash=debug` to emit startup, PTY-read-to-UI, parser-batch, PTY-write, font-fallback, dirty-row rebuild, partial atlas upload, partial instance upload, redraw-to-present, and render-submit timings. At info level, Flash reports first-window/renderer/PTY/present milestones, fixed-bucket p50/p95/p99 frame summaries, and one-second PTY-to-present summaries. `FLASH_INPUT_LATENCY_PROBE=1` injects one byte after the first usable frame and reports the resulting input-to-present latency without requiring external input automation. Startup keeps the Wayland window hidden until a content-bearing frame has been presented when shell output arrives promptly, with a one-shot fallback deadline for silent shells. PTY input uses a bounded asynchronous writer queue, sustained output is parsed in bounded time/byte slices that yield to presentation, and fallback fonts are selected and parsed off the render thread. All three workers block while idle rather than polling.
 
-The exact Phase 9 benchmark commands, environment, baseline, and results are recorded in [`PERFORMANCE.md`](PERFORMANCE.md).
+The exact Phase 9 benchmark commands, environment, baseline, audit reruns, and results are recorded in [`PERFORMANCE.md`](PERFORMANCE.md). `scripts/phase9-unicode-audit.sh` provides a repeatable Unicode, color, PTY-size, and alternate-screen runtime workload.
 
 ## Unicode and Emoji Policy
 
@@ -222,7 +248,7 @@ For v0.1, emoji are rendered as monochrome outline glyphs through the same font 
 
 ## Development Status
 
-Phase 9 adds a repeatable allocation-counting throughput benchmark; instrumented startup, PTY, frame-distribution, and input-to-present measurements; allocation-free CSI parameter extraction; reusable scrollback rows; batched PTY parsing; shared backing storage for large paste chunks; terminal row-damage versions; per-row render caches; sparse instance-buffer writes; and dirty-region glyph-atlas uploads. The event loop and worker queues remain blocking and bounded while idle. Phase 9 is complete and awaiting review; no later phase has started.
+Phase 9 adds a repeatable allocation-counting throughput benchmark; instrumented startup, PTY, frame-distribution, and input-to-present measurements; allocation-free CSI parameter extraction; reusable scrollback rows; batched PTY parsing; shared backing storage for large paste chunks; terminal row-damage versions; per-row render caches; sparse instance-buffer writes; and dirty-region glyph-atlas uploads. The Phase 1–9 audit additionally hardened cursor/mode semantics, mouse reporting and selection separation, screen-buffer transitions, PTY shutdown, startup sizing, renderer invalidation, atlas bounds, and runtime diagnostics. The visual-polish pass adds Flash's cool-neutral palette, color-space-correct output, logical padding, configurable cursor geometry, and selection-only render colors without modifying the terminal model. The event loop and worker queues remain blocking and bounded while idle. Phase 9 and visual polish are complete; no later phase has started.
 
 ## References
 

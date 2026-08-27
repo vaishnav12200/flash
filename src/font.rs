@@ -23,6 +23,7 @@ pub const DEFAULT_FONT_SIZE: f32 = 18.0;
 const GLYPH_PADDING: u32 = 1;
 const FALLBACK_REQUEST_CAPACITY: usize = 64;
 const FALLBACK_RESPONSE_CAPACITY: usize = 16;
+const MAX_MISSING_GLYPHS: usize = 4096;
 
 #[derive(Debug, Clone, Copy)]
 pub struct GlyphInfo {
@@ -75,6 +76,7 @@ pub struct GlyphAtlas {
     baseline: f32,
     packer: ShelfPacker,
     dirty_region: Option<AtlasRegion>,
+    atlas_full: bool,
 }
 
 struct FallbackResponse {
@@ -180,6 +182,7 @@ impl GlyphAtlas {
             baseline,
             packer: ShelfPacker::new(ATLAS_SIZE, ATLAS_SIZE, 2, 1),
             dirty_region: None,
+            atlas_full: false,
             cell_width,
             cell_height,
             solid_uv_min: [0.5 / ATLAS_SIZE as f32; 2],
@@ -221,6 +224,9 @@ impl GlyphAtlas {
         if self.missing.contains(&character) {
             return self.replacement_glyph();
         }
+        if self.atlas_full {
+            return self.replacement_glyph();
+        }
         match self.cache_glyph(character) {
             Ok(Some(glyph)) => Some(glyph),
             Ok(None) => {
@@ -231,7 +237,7 @@ impl GlyphAtlas {
                         }
                         Err(TrySendError::Full(_)) => {}
                         Err(TrySendError::Disconnected(_)) => {
-                            self.missing.insert(character);
+                            self.mark_missing(character);
                         }
                     }
                 }
@@ -239,12 +245,12 @@ impl GlyphAtlas {
             }
             Err(FontError::AtlasFull) => {
                 tracing::warn!(character = %character, "glyph atlas is full; using replacement glyph");
-                self.missing.insert(character);
+                self.atlas_full = true;
                 self.replacement_glyph()
             }
             Err(error) => {
                 tracing::warn!(%error, character = %character, "could not cache glyph");
-                self.missing.insert(character);
+                self.mark_missing(character);
                 self.replacement_glyph()
             }
         }
@@ -265,7 +271,7 @@ impl GlyphAtlas {
                 }
             }
             if !response.found {
-                self.missing.insert(response.character);
+                self.mark_missing(response.character);
             }
             tracing::debug!(
                 character = %response.character,
@@ -288,6 +294,12 @@ impl GlyphAtlas {
             .get(&'\u{fffd}')
             .or_else(|| self.glyphs.get(&'?'))
             .copied()
+    }
+
+    fn mark_missing(&mut self, character: char) {
+        if self.missing.len() < MAX_MISSING_GLYPHS {
+            self.missing.insert(character);
+        }
     }
 
     fn cache_glyph(&mut self, character: char) -> Result<Option<GlyphInfo>, FontError> {
@@ -574,6 +586,51 @@ mod tests {
             "preloaded atlas starts clean"
         );
         assert!(atlas.glyph('é').is_some());
+        let region = atlas
+            .take_dirty_region()
+            .expect("a first-use Unicode glyph dirties one atlas region");
+        assert!(region.width * region.height < ATLAS_SIZE * ATLAS_SIZE);
+        assert!(atlas.glyph('é').is_some());
+        assert!(
+            atlas.take_dirty_region().is_none(),
+            "a cached glyph must not trigger another atlas upload"
+        );
+    }
+
+    #[test]
+    fn dirty_regions_union_without_exceeding_the_atlas() {
+        let first = super::AtlasRegion {
+            x: 10,
+            y: 20,
+            width: 5,
+            height: 6,
+        };
+        let union = first.union(super::AtlasRegion {
+            x: 12,
+            y: 18,
+            width: 8,
+            height: 4,
+        });
+        assert_eq!(
+            union,
+            super::AtlasRegion {
+                x: 10,
+                y: 18,
+                width: 10,
+                height: 8,
+            }
+        );
+        assert!(union.x + union.width <= ATLAS_SIZE);
+        assert!(union.y + union.height <= ATLAS_SIZE);
+    }
+
+    #[test]
+    fn negative_glyph_cache_is_bounded() {
+        let mut atlas = GlyphAtlas::load_default(1.0).expect("JetBrains Mono must be installed");
+        for value in 0x10_000..0x10_000 + super::MAX_MISSING_GLYPHS as u32 + 100 {
+            atlas.mark_missing(char::from_u32(value).expect("test range contains scalar values"));
+        }
+        assert_eq!(atlas.missing.len(), super::MAX_MISSING_GLYPHS);
     }
 
     #[test]

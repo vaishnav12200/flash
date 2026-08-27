@@ -1,4 +1,4 @@
-use std::{env, fs, path::PathBuf};
+use std::{env, fs, path::PathBuf, sync::OnceLock};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -11,6 +11,8 @@ use crate::font::{DEFAULT_FONT_PATH, DEFAULT_FONT_SIZE};
 pub struct Config {
     pub font: FontConfig,
     pub window: WindowConfig,
+    pub colors: ColorsConfig,
+    pub cursor: CursorConfig,
     pub scrollback: ScrollbackConfig,
     pub keybindings: KeybindingsConfig,
 }
@@ -38,19 +40,108 @@ impl Default for FontConfig {
 pub struct WindowConfig {
     pub padding_x: f32,
     pub padding_y: f32,
-    pub foreground: String,
-    pub background: String,
+    /// Deprecated compatibility aliases. When present, these override the
+    /// corresponding `[colors]` values.
+    pub foreground: Option<String>,
+    pub background: Option<String>,
 }
 
 impl Default for WindowConfig {
     fn default() -> Self {
         Self {
-            padding_x: 8.0,
-            padding_y: 8.0,
-            foreground: "#E6EBF5".to_owned(),
-            background: "#090A0E".to_owned(),
+            padding_x: 14.0,
+            padding_y: 12.0,
+            foreground: None,
+            background: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ColorsConfig {
+    pub background: String,
+    pub foreground: String,
+    pub cursor: String,
+    pub selection_background: String,
+    pub selection_foreground: String,
+    pub black: String,
+    pub red: String,
+    pub green: String,
+    pub yellow: String,
+    pub blue: String,
+    pub magenta: String,
+    pub cyan: String,
+    pub white: String,
+    pub bright_black: String,
+    pub bright_red: String,
+    pub bright_green: String,
+    pub bright_yellow: String,
+    pub bright_blue: String,
+    pub bright_magenta: String,
+    pub bright_cyan: String,
+    pub bright_white: String,
+}
+
+impl Default for ColorsConfig {
+    fn default() -> Self {
+        Self {
+            background: "#0B0F14".to_owned(),
+            foreground: "#DCE3EA".to_owned(),
+            cursor: "#4CC9F0".to_owned(),
+            selection_background: "#264F63".to_owned(),
+            selection_foreground: "#F4F7FA".to_owned(),
+            black: "#1B232D".to_owned(),
+            red: "#D96868".to_owned(),
+            green: "#7BC98C".to_owned(),
+            yellow: "#D6B86A".to_owned(),
+            blue: "#6FA8DC".to_owned(),
+            magenta: "#B48ECA".to_owned(),
+            cyan: "#56B6C2".to_owned(),
+            white: "#C7D0D9".to_owned(),
+            bright_black: "#5C6773".to_owned(),
+            bright_red: "#E47B7B".to_owned(),
+            bright_green: "#91D39E".to_owned(),
+            bright_yellow: "#E0C47A".to_owned(),
+            bright_blue: "#82B9E8".to_owned(),
+            bright_magenta: "#C39BD3".to_owned(),
+            bright_cyan: "#6CCAD2".to_owned(),
+            bright_white: "#EEF3F7".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CursorStyle {
+    #[default]
+    Block,
+    Beam,
+    Underline,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CursorConfig {
+    pub style: CursorStyle,
+}
+
+impl Default for CursorConfig {
+    fn default() -> Self {
+        Self {
+            style: CursorStyle::Block,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct VisualColors {
+    pub background: [f32; 4],
+    pub foreground: [f32; 4],
+    pub cursor: [f32; 4],
+    pub selection_background: [f32; 4],
+    pub selection_foreground: [f32; 4],
+    pub ansi: [[f32; 4]; 16],
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -137,10 +228,63 @@ impl Config {
         if self.scrollback.lines > 1_000_000 {
             bail!("scrollback.lines must not exceed 1000000");
         }
-        parse_color(&self.window.foreground).context("window.foreground")?;
-        parse_color(&self.window.background).context("window.background")?;
+        self.visual_colors()?;
         ShortcutMap::from_config(&self.keybindings)?;
         Ok(())
+    }
+
+    pub fn visual_colors(&self) -> Result<VisualColors> {
+        let colors = &self.colors;
+        let foreground = self
+            .window
+            .foreground
+            .as_deref()
+            .unwrap_or(&colors.foreground);
+        let background = self
+            .window
+            .background
+            .as_deref()
+            .unwrap_or(&colors.background);
+        let named = [
+            ("colors.black", &colors.black),
+            ("colors.red", &colors.red),
+            ("colors.green", &colors.green),
+            ("colors.yellow", &colors.yellow),
+            ("colors.blue", &colors.blue),
+            ("colors.magenta", &colors.magenta),
+            ("colors.cyan", &colors.cyan),
+            ("colors.white", &colors.white),
+            ("colors.bright_black", &colors.bright_black),
+            ("colors.bright_red", &colors.bright_red),
+            ("colors.bright_green", &colors.bright_green),
+            ("colors.bright_yellow", &colors.bright_yellow),
+            ("colors.bright_blue", &colors.bright_blue),
+            ("colors.bright_magenta", &colors.bright_magenta),
+            ("colors.bright_cyan", &colors.bright_cyan),
+            ("colors.bright_white", &colors.bright_white),
+        ];
+        let mut ansi = [[0.0; 4]; 16];
+        for (index, (name, value)) in named.into_iter().enumerate() {
+            ansi[index] = parse_color(value).with_context(|| name.to_owned())?;
+        }
+        Ok(VisualColors {
+            background: parse_color(background).context(if self.window.background.is_some() {
+                "window.background"
+            } else {
+                "colors.background"
+            })?,
+            foreground: parse_color(foreground).context(if self.window.foreground.is_some() {
+                "window.foreground"
+            } else {
+                "colors.foreground"
+            })?,
+            cursor: parse_color(&colors.cursor).context("colors.cursor")?,
+            selection_background: parse_color(&colors.selection_background)
+                .context("colors.selection_background")?,
+            selection_foreground: parse_color(&colors.selection_foreground)
+                .context("colors.selection_foreground")?,
+            ansi,
+        })
     }
 }
 
@@ -163,11 +307,25 @@ pub fn parse_color(value: &str) -> Result<[f32; 4]> {
     let green = u8::from_str_radix(&value[2..4], 16).context("invalid green component")?;
     let blue = u8::from_str_radix(&value[4..6], 16).context("invalid blue component")?;
     Ok([
-        red as f32 / 255.0,
-        green as f32 / 255.0,
-        blue as f32 / 255.0,
+        srgb_to_linear(red),
+        srgb_to_linear(green),
+        srgb_to_linear(blue),
         1.0,
     ])
+}
+
+pub(crate) fn srgb_to_linear(component: u8) -> f32 {
+    static LOOKUP: OnceLock<[f32; 256]> = OnceLock::new();
+    LOOKUP.get_or_init(|| {
+        std::array::from_fn(|index| {
+            let value = index as f32 / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        })
+    })[component as usize]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,16 +454,28 @@ fn parse_shortcut_key(value: &str) -> Result<ShortcutKey> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, KeybindingsConfig, ShortcutAction, ShortcutMap, parse_color};
+    use super::{Config, CursorStyle, KeybindingsConfig, ShortcutAction, ShortcutMap, parse_color};
     use winit::keyboard::{Key, ModifiersState};
 
     #[test]
     fn parses_hex_colors() {
-        assert_eq!(
-            parse_color("#FF8000").unwrap(),
-            [1.0, 128.0 / 255.0, 0.0, 1.0]
-        );
+        let color = parse_color("#FF8000").unwrap();
+        assert_eq!(color[0], 1.0);
+        assert!((color[1] - 0.215_860_53).abs() < 0.000_001);
+        assert_eq!(color[2..], [0.0, 1.0]);
         assert!(parse_color("orange").is_err());
+    }
+
+    #[test]
+    fn default_visual_system_uses_flash_palette_and_spacing() {
+        let config = Config::default();
+        assert_eq!(config.window.padding_x, 14.0);
+        assert_eq!(config.window.padding_y, 12.0);
+        assert_eq!(config.colors.background, "#0B0F14");
+        assert_eq!(config.colors.foreground, "#DCE3EA");
+        assert_eq!(config.colors.cursor, "#4CC9F0");
+        assert_eq!(config.cursor.style, CursorStyle::Block);
+        assert_eq!(config.visual_colors().unwrap().ansi.len(), 16);
     }
 
     #[test]
@@ -321,9 +491,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.font.size, 20.0);
-        assert_eq!(config.window.background, "#112233");
+        assert_eq!(config.window.background.as_deref(), Some("#112233"));
         assert_eq!(config.scrollback.lines, 10_000);
         assert_eq!(config.keybindings.copy, "Ctrl+Shift+C");
+    }
+
+    #[test]
+    fn colors_section_and_cursor_styles_are_configurable() {
+        let config: Config = toml::from_str(
+            r##"
+                [colors]
+                background = "#101820"
+                cyan = "#40C0D0"
+
+                [cursor]
+                style = "beam"
+            "##,
+        )
+        .unwrap();
+        assert_eq!(config.colors.background, "#101820");
+        assert_eq!(config.colors.cyan, "#40C0D0");
+        assert_eq!(config.cursor.style, CursorStyle::Beam);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn legacy_window_colors_override_the_new_palette_fields() {
+        let config: Config = toml::from_str(
+            r##"
+                [window]
+                foreground = "#102030"
+                background = "#405060"
+            "##,
+        )
+        .unwrap();
+        let visual = config.visual_colors().unwrap();
+        assert_eq!(visual.foreground, parse_color("#102030").unwrap());
+        assert_eq!(visual.background, parse_color("#405060").unwrap());
     }
 
     #[test]
