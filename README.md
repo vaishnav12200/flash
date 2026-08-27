@@ -4,7 +4,7 @@
 
 Flash is an early-stage terminal emulator project focused on **low input latency**, **fast startup**, **low memory overhead**, and **correct terminal behavior**. It will connect a real user shell to a Linux pseudo-terminal (PTY), interpret ANSI/VT output into a terminal grid, and render that grid through a GPU pipeline.
 
-> **Project status: Phases 1–9 implemented and technically audited; visual-polish pass complete.** Flash has a restrained native visual system while retaining its measured dirty-row rendering, partial GPU uploads, bounded queues, and event-driven idle behavior. No later roadmap phase has started.
+> **Project status: Phases 1–9 implemented and technically audited; visual identity pass complete.** Flash uses a spacious near-black/orange theme and a legacy-green cursor while retaining dirty-row rendering, partial GPU uploads, bounded queues, and event-driven idle behavior. The UI contains no permanent logo or decorative panel, and no later roadmap phase has started.
 
 ## Goals
 
@@ -159,34 +159,37 @@ fallback = []
 size = 18.0
 
 [window]
-padding_x = 14.0
-padding_y = 12.0
+padding_x = 20.0
+padding_y = 16.0
 
 [colors]
-background = "#0B0F14"
-foreground = "#DCE3EA"
-cursor = "#4CC9F0"
-selection_background = "#264F63"
-selection_foreground = "#F4F7FA"
-black = "#1B232D"
-red = "#D96868"
-green = "#7BC98C"
-yellow = "#D6B86A"
-blue = "#6FA8DC"
-magenta = "#B48ECA"
-cyan = "#56B6C2"
-white = "#C7D0D9"
-bright_black = "#5C6773"
-bright_red = "#E47B7B"
-bright_green = "#91D39E"
-bright_yellow = "#E0C47A"
-bright_blue = "#82B9E8"
-bright_magenta = "#C39BD3"
-bright_cyan = "#6CCAD2"
-bright_white = "#EEF3F7"
+background = "#080A0D"
+foreground = "#D8DEE9"
+cursor = "#41E66B"
+accent = "#FF8A2A"
+selection_background = "#3A261E"
+selection_foreground = "#F2E9E1"
+black = "#161A1F"
+red = "#D96666"
+green = "#72C991"
+yellow = "#D99A5E"
+blue = "#6A9FD0"
+magenta = "#B27AB4"
+cyan = "#58B8B0"
+white = "#C5CBD3"
+bright_black = "#606873"
+bright_red = "#E27772"
+bright_green = "#8AD5A5"
+bright_yellow = "#E8BB6A"
+bright_blue = "#80B1DF"
+bright_magenta = "#C48BC5"
+bright_cyan = "#70CEC2"
+bright_white = "#F0F2F5"
 
 [cursor]
 style = "block" # block, beam, or underline
+blink = true
+blink_interval = 600 # milliseconds, 100..=2000
 
 [scrollback]
 lines = 10000
@@ -204,7 +207,9 @@ scroll_to_bottom = "Ctrl+Shift+End"
 
 Colors use `#RRGGBB` sRGB values and are converted to the GPU surface's linear working space, so configured values appear as authored. The legacy `window.foreground` and `window.background` keys remain accepted and override their `[colors]` equivalents. Font size is restricted to `6..=72`, padding is specified in logical pixels and must be non-negative, and scrollback is capped at one million lines. Invalid files produce field-specific diagnostics and Flash safely falls back to defaults for that launch.
 
-Cursor blinking and window opacity are deliberately not implemented. Flash remains opaque, and the cursor remains event-driven, avoiding compositor-specific transparency behavior and idle redraw timers.
+Cursor blinking uses `ControlFlow::WaitUntil`: Flash wakes only at a configured visibility transition, rebuilds only the cursor row, and immediately restores the cursor when keyboard input or PTY output arrives. Set `blink = false` for fully static idle behavior. Window opacity remains deliberately unsupported because native Wayland alpha/compositor behavior has not been validated across target desktops. Outer corner treatment remains compositor-managed rather than introducing custom window decorations.
+
+Flash deliberately renders no built-in logo, watermark, system-information panel, or prompt text. Shell prompts and any artwork from programs such as fastfetch remain ordinary PTY output. The warm ANSI palette, configurable spacing, selection treatment, and high-contrast green cursor provide the visual identity without guessing at shell-owned prompt semantics.
 
 `font.fallback` is an optional ordered list of font files. Flash tries the configured primary face first, then configured fallback faces, then a character-specific system face reported by Fontconfig. Missing faces are parsed on a bounded background loader instead of the render thread; a replacement glyph is shown until the requested face is ready. Unicode glyphs are rasterized lazily into a bounded texture atlas.
 
@@ -248,7 +253,7 @@ For v0.1, emoji are rendered as monochrome outline glyphs through the same font 
 
 ## Development Status
 
-Phase 9 adds a repeatable allocation-counting throughput benchmark; instrumented startup, PTY, frame-distribution, and input-to-present measurements; allocation-free CSI parameter extraction; reusable scrollback rows; batched PTY parsing; shared backing storage for large paste chunks; terminal row-damage versions; per-row render caches; sparse instance-buffer writes; and dirty-region glyph-atlas uploads. The Phase 1–9 audit additionally hardened cursor/mode semantics, mouse reporting and selection separation, screen-buffer transitions, PTY shutdown, startup sizing, renderer invalidation, atlas bounds, and runtime diagnostics. The visual-polish pass adds Flash's cool-neutral palette, color-space-correct output, logical padding, configurable cursor geometry, and selection-only render colors without modifying the terminal model. The event loop and worker queues remain blocking and bounded while idle. Phase 9 and visual polish are complete; no later phase has started.
+Phase 9 adds a repeatable allocation-counting throughput benchmark; instrumented startup, PTY, frame-distribution, and input-to-present measurements; allocation-free CSI parameter extraction; reusable scrollback rows; batched PTY parsing; shared backing storage for large paste chunks; terminal row-damage versions; per-row render caches; sparse instance-buffer writes; and dirty-region glyph-atlas uploads. The Phase 1–9 audit additionally hardened cursor/mode semantics, mouse reporting and selection separation, screen-buffer transitions, PTY shutdown, startup sizing, renderer invalidation, atlas bounds, and runtime diagnostics. The visual-identity pass adds Flash's near-black/orange palette, color-space-correct output, logical padding, configurable cursor geometry/blinking, warm selection colors, and a logo-free minimal surface without modifying the terminal model. Phase 9 and visual identity work are complete; no later phase has started.
 
 ## References
 

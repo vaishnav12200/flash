@@ -9,7 +9,7 @@ use winit::{
     application::ApplicationHandler,
     dpi::{PhysicalPosition, PhysicalSize},
     event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::{ActiveEventLoop, EventLoopProxy},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy},
     keyboard::ModifiersState,
     window::{Window, WindowId},
 };
@@ -82,6 +82,9 @@ pub struct App {
     input_latency_probe_pending: bool,
     surface_timeout_retries: u8,
     title_version: u64,
+    cursor_blink_visible: bool,
+    cursor_blink_deadline: Option<Instant>,
+    window_focused: bool,
 }
 
 struct PendingInput {
@@ -235,6 +238,9 @@ impl App {
                 .is_some_and(|value| value == "1"),
             surface_timeout_retries: 0,
             title_version: 0,
+            cursor_blink_visible: true,
+            cursor_blink_deadline: None,
+            window_focused: true,
         }
     }
 
@@ -246,6 +252,16 @@ impl App {
         self.window_visible
             || self.latency.first_output_read_at.is_some()
             || self.initial_frame_deadline_reached
+    }
+
+    fn restart_cursor_blink(&mut self) {
+        let needs_redraw = !self.cursor_blink_visible;
+        self.cursor_blink_visible = true;
+        self.cursor_blink_deadline = (self.config.cursor.blink && self.window_focused)
+            .then(|| Instant::now() + Duration::from_millis(self.config.cursor.blink_interval));
+        if needs_redraw && let Some(window) = self.window() {
+            window.request_redraw();
+        }
     }
 
     fn desired_pty_dimensions(&self) -> Option<PtyDimensions> {
@@ -344,6 +360,7 @@ impl App {
             let process_started_at = Instant::now();
             self.terminal_parser
                 .process(&mut self.terminal, &self.pty_output_batch);
+            self.restart_cursor_blink();
             if self.terminal.mouse_tracking() == MouseTracking::None {
                 self.reported_mouse_button = None;
             } else {
@@ -454,6 +471,7 @@ impl App {
         if event.state != ElementState::Pressed {
             return;
         }
+        self.restart_cursor_blink();
         if let Some(action) = self.shortcuts.action(&event.logical_key, self.modifiers) {
             self.handle_shortcut(action);
             return;
@@ -580,6 +598,19 @@ impl App {
 
 fn should_report_mouse(mouse_tracking: MouseTracking, shift_override: bool) -> bool {
     mouse_tracking != MouseTracking::None && !shift_override
+}
+
+fn advance_cursor_blink(
+    visible: bool,
+    deadline: Instant,
+    now: Instant,
+    interval: Duration,
+) -> (bool, Instant, bool) {
+    if now < deadline {
+        (visible, deadline, false)
+    } else {
+        (!visible, now + interval, true)
+    }
 }
 
 impl ApplicationHandler<AppEvent> for App {
@@ -719,6 +750,7 @@ impl ApplicationHandler<AppEvent> for App {
         );
         self.synchronize_terminal_size();
         self.window = Some(window);
+        self.restart_cursor_blink();
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
@@ -816,6 +848,19 @@ impl ApplicationHandler<AppEvent> for App {
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
+            }
+            WindowEvent::Focused(focused) => {
+                self.window_focused = focused;
+                if focused {
+                    self.restart_cursor_blink();
+                } else {
+                    let needs_redraw = !self.cursor_blink_visible;
+                    self.cursor_blink_visible = true;
+                    self.cursor_blink_deadline = None;
+                    if needs_redraw && let Some(window) = self.window() {
+                        window.request_redraw();
+                    }
+                }
             }
             WindowEvent::KeyboardInput { event, .. } => self.forward_keyboard_input(event),
             WindowEvent::CursorMoved { position, .. } => {
@@ -920,12 +965,16 @@ impl ApplicationHandler<AppEvent> for App {
                 if !self.initial_redraw_allowed() {
                     return;
                 }
+                let mut snapshot = self.terminal.render_snapshot();
+                if self.config.cursor.blink && !self.cursor_blink_visible {
+                    snapshot.cursor_visible = false;
+                }
                 let Some(renderer) = self.renderer.as_mut() else {
                     return;
                 };
 
                 let render_started_at = Instant::now();
-                match renderer.render(self.terminal.render_snapshot()) {
+                match renderer.render(snapshot) {
                     Ok(RenderOutcome::Presented) => {
                         self.surface_timeout_retries = 0;
                         let presented_at = Instant::now();
@@ -1068,13 +1117,35 @@ impl ApplicationHandler<AppEvent> for App {
         self.pty.take();
         tracing::info!("Flash is exiting");
     }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let terminal_cursor_visible = self.terminal.render_snapshot().cursor_visible;
+        if !self.config.cursor.blink || !self.window_focused || !terminal_cursor_visible {
+            self.cursor_blink_visible = true;
+            self.cursor_blink_deadline = None;
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+
+        let interval = Duration::from_millis(self.config.cursor.blink_interval);
+        let now = Instant::now();
+        let deadline = self.cursor_blink_deadline.unwrap_or(now + interval);
+        let (visible, deadline, changed) =
+            advance_cursor_blink(self.cursor_blink_visible, deadline, now, interval);
+        self.cursor_blink_visible = visible;
+        if changed && let Some(window) = self.window() {
+            window.request_redraw();
+        }
+        self.cursor_blink_deadline = Some(deadline);
+        event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::{sync::Arc, time::Instant};
 
-    use super::{LatencyHistogram, PendingInput, should_report_mouse};
+    use super::{LatencyHistogram, PendingInput, advance_cursor_blink, should_report_mouse};
     use crate::pty::INPUT_CHUNK_SIZE;
     use crate::terminal::MouseTracking;
 
@@ -1123,5 +1194,20 @@ mod tests {
         assert!(should_report_mouse(MouseTracking::ButtonMotion, false));
         assert!(should_report_mouse(MouseTracking::AnyMotion, false));
         assert!(!should_report_mouse(MouseTracking::Button, true));
+    }
+
+    #[test]
+    fn cursor_blink_changes_only_at_scheduled_transitions() {
+        let now = Instant::now();
+        let interval = std::time::Duration::from_millis(600);
+        let deadline = now + interval;
+        assert_eq!(
+            advance_cursor_blink(true, deadline, now, interval),
+            (true, deadline, false)
+        );
+        assert_eq!(
+            advance_cursor_blink(true, deadline, deadline, interval),
+            (false, deadline + interval, true)
+        );
     }
 }

@@ -75,6 +75,7 @@ pub struct Renderer {
     row_instances: Vec<RowInstances>,
     row_versions: Vec<u64>,
     cached_columns: usize,
+    cached_cursor_visible: bool,
     surface_configured: bool,
     settings: RendererSettings,
     scale_factor: f64,
@@ -366,6 +367,7 @@ impl Renderer {
             row_instances: Vec::new(),
             row_versions: Vec::new(),
             cached_columns: 0,
+            cached_cursor_visible: false,
             surface_configured: false,
             settings,
             scale_factor,
@@ -511,8 +513,8 @@ impl Renderer {
             let scissor_y = self.settings.padding_y.max(0.0) as u32;
             if content.width > 0 && content.height > 0 {
                 pass.set_scissor_rect(scissor_x, scissor_y, content.width, content.height);
+                pass.draw(0..6, 0..self.instances.len() as u32);
             }
-            pass.draw(0..6, 0..self.instances.len() as u32);
         }
         self.queue.submit([encoder.finish()]);
         surface_texture.present();
@@ -529,12 +531,14 @@ impl Renderer {
             self.row_versions.resize(snapshot.rows, 0);
             self.cached_columns = snapshot.columns;
         }
+        let cursor_visibility_changed = self.cached_cursor_visible != snapshot.cursor_visible;
 
         let mut dirty_row_count = 0;
         for row in 0..snapshot.rows {
             if force_rebuild
                 || dimensions_changed
                 || self.row_versions[row] != snapshot.row_versions[row]
+                || (cursor_visibility_changed && row == snapshot.cursor.row)
             {
                 let mut instances = mem::take(&mut self.row_instances[row]);
                 self.build_row_instances(snapshot, row, &mut instances);
@@ -546,6 +550,7 @@ impl Renderer {
         if dirty_row_count == 0 {
             return;
         }
+        self.cached_cursor_visible = snapshot.cursor_visible;
 
         self.staged_instances.clear();
         for row in &self.row_instances {
@@ -644,8 +649,19 @@ impl Renderer {
             );
             let mut color = self.settings.cursor;
             if self.settings.cursor_style == CursorStyle::Block {
-                color[3] = 0.68;
+                color[3] = 0.90;
             }
+            let halo = self.scale_factor.max(1.0) as f32;
+            let mut halo_color = self.settings.cursor;
+            halo_color[3] = 0.08;
+            instances.cursor.push(GlyphInstance {
+                position: [position[0] - halo, position[1] - halo],
+                size: [size[0] + halo * 2.0, size[1] + halo * 2.0],
+                uv_min: self.atlas.solid_uv_min,
+                uv_max: self.atlas.solid_uv_max,
+                color: halo_color,
+                style: [0.0; 2],
+            });
             instances.cursor.push(GlyphInstance {
                 position,
                 size,

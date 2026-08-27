@@ -49,8 +49,8 @@ pub struct WindowConfig {
 impl Default for WindowConfig {
     fn default() -> Self {
         Self {
-            padding_x: 14.0,
-            padding_y: 12.0,
+            padding_x: 20.0,
+            padding_y: 16.0,
             foreground: None,
             background: None,
         }
@@ -63,6 +63,7 @@ pub struct ColorsConfig {
     pub background: String,
     pub foreground: String,
     pub cursor: String,
+    pub accent: String,
     pub selection_background: String,
     pub selection_foreground: String,
     pub black: String,
@@ -86,27 +87,28 @@ pub struct ColorsConfig {
 impl Default for ColorsConfig {
     fn default() -> Self {
         Self {
-            background: "#0B0F14".to_owned(),
-            foreground: "#DCE3EA".to_owned(),
-            cursor: "#4CC9F0".to_owned(),
-            selection_background: "#264F63".to_owned(),
-            selection_foreground: "#F4F7FA".to_owned(),
-            black: "#1B232D".to_owned(),
-            red: "#D96868".to_owned(),
-            green: "#7BC98C".to_owned(),
-            yellow: "#D6B86A".to_owned(),
-            blue: "#6FA8DC".to_owned(),
-            magenta: "#B48ECA".to_owned(),
-            cyan: "#56B6C2".to_owned(),
-            white: "#C7D0D9".to_owned(),
-            bright_black: "#5C6773".to_owned(),
-            bright_red: "#E47B7B".to_owned(),
-            bright_green: "#91D39E".to_owned(),
-            bright_yellow: "#E0C47A".to_owned(),
-            bright_blue: "#82B9E8".to_owned(),
-            bright_magenta: "#C39BD3".to_owned(),
-            bright_cyan: "#6CCAD2".to_owned(),
-            bright_white: "#EEF3F7".to_owned(),
+            background: "#080A0D".to_owned(),
+            foreground: "#D8DEE9".to_owned(),
+            cursor: "#41E66B".to_owned(),
+            accent: "#FF8A2A".to_owned(),
+            selection_background: "#3A261E".to_owned(),
+            selection_foreground: "#F2E9E1".to_owned(),
+            black: "#161A1F".to_owned(),
+            red: "#D96666".to_owned(),
+            green: "#72C991".to_owned(),
+            yellow: "#D99A5E".to_owned(),
+            blue: "#6A9FD0".to_owned(),
+            magenta: "#B27AB4".to_owned(),
+            cyan: "#58B8B0".to_owned(),
+            white: "#C5CBD3".to_owned(),
+            bright_black: "#606873".to_owned(),
+            bright_red: "#E27772".to_owned(),
+            bright_green: "#8AD5A5".to_owned(),
+            bright_yellow: "#E8BB6A".to_owned(),
+            bright_blue: "#80B1DF".to_owned(),
+            bright_magenta: "#C48BC5".to_owned(),
+            bright_cyan: "#70CEC2".to_owned(),
+            bright_white: "#F0F2F5".to_owned(),
         }
     }
 }
@@ -124,12 +126,16 @@ pub enum CursorStyle {
 #[serde(default, deny_unknown_fields)]
 pub struct CursorConfig {
     pub style: CursorStyle,
+    pub blink: bool,
+    pub blink_interval: u64,
 }
 
 impl Default for CursorConfig {
     fn default() -> Self {
         Self {
             style: CursorStyle::Block,
+            blink: true,
+            blink_interval: 600,
         }
     }
 }
@@ -228,6 +234,9 @@ impl Config {
         if self.scrollback.lines > 1_000_000 {
             bail!("scrollback.lines must not exceed 1000000");
         }
+        if !(100..=2_000).contains(&self.cursor.blink_interval) {
+            bail!("cursor.blink_interval must be between 100 and 2000 milliseconds");
+        }
         self.visual_colors()?;
         ShortcutMap::from_config(&self.keybindings)?;
         Ok(())
@@ -267,6 +276,7 @@ impl Config {
         for (index, (name, value)) in named.into_iter().enumerate() {
             ansi[index] = parse_color(value).with_context(|| name.to_owned())?;
         }
+        parse_color(&colors.accent).context("colors.accent")?;
         Ok(VisualColors {
             background: parse_color(background).context(if self.window.background.is_some() {
                 "window.background"
@@ -469,12 +479,15 @@ mod tests {
     #[test]
     fn default_visual_system_uses_flash_palette_and_spacing() {
         let config = Config::default();
-        assert_eq!(config.window.padding_x, 14.0);
-        assert_eq!(config.window.padding_y, 12.0);
-        assert_eq!(config.colors.background, "#0B0F14");
-        assert_eq!(config.colors.foreground, "#DCE3EA");
-        assert_eq!(config.colors.cursor, "#4CC9F0");
+        assert_eq!(config.window.padding_x, 20.0);
+        assert_eq!(config.window.padding_y, 16.0);
+        assert_eq!(config.colors.background, "#080A0D");
+        assert_eq!(config.colors.foreground, "#D8DEE9");
+        assert_eq!(config.colors.cursor, "#41E66B");
+        assert_eq!(config.colors.accent, "#FF8A2A");
         assert_eq!(config.cursor.style, CursorStyle::Block);
+        assert!(config.cursor.blink);
+        assert_eq!(config.cursor.blink_interval, 600);
         assert_eq!(config.visual_colors().unwrap().ansi.len(), 16);
     }
 
@@ -506,13 +519,29 @@ mod tests {
 
                 [cursor]
                 style = "beam"
+                blink = false
+                blink_interval = 900
             "##,
         )
         .unwrap();
         assert_eq!(config.colors.background, "#101820");
         assert_eq!(config.colors.cyan, "#40C0D0");
         assert_eq!(config.cursor.style, CursorStyle::Beam);
+        assert!(!config.cursor.blink);
+        assert_eq!(config.cursor.blink_interval, 900);
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_cursor_blink_intervals_that_could_cause_busy_redraws() {
+        let config: Config = toml::from_str(
+            r#"
+                [cursor]
+                blink_interval = 50
+            "#,
+        )
+        .unwrap();
+        assert!(config.validate().is_err());
     }
 
     #[test]
