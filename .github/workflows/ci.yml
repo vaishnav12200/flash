@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Format, lint, test, and build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Linux runtime dependencies
+        run: sudo apt-get update && sudo apt-get install -y fontconfig fonts-dejavu-core
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      - name: Formatting
+        run: cargo +stable fmt --check
+      - name: Clippy
+        run: cargo +stable clippy --locked --all-targets --all-features -- -D warnings
+      - name: Tests
+        run: cargo +stable test --locked --all-features
+      - name: Release build
+        run: cargo +stable build --release --locked
+      - name: RustSec audit
+        run: |
+          cargo +stable install cargo-audit --version 0.22.2 --locked
+          cargo +stable audit
+      - name: Package metadata
+        run: cargo +stable package --locked --no-verify
+      - name: Whitespace
+        run: git diff --check
+
+  msrv:
+    name: Rust 1.88 MSRV on Debian 12
+    runs-on: ubuntu-24.04
+    container:
+      image: docker.io/library/rust@sha256:4727898c104ecd2e22d780925832502faee9fe4e70581b8572af081370b315a0
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install portable font baseline
+        run: apt-get update && apt-get install -y fontconfig fonts-dejavu-core
+      - name: Check locked dependency graph
+        run: cargo check --locked --all-targets --all-features

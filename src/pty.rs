@@ -126,7 +126,7 @@ impl PtySession {
         let mut child = pair
             .slave
             .spawn_command(command)
-            .with_context(|| format!("could not start shell {:?}", shell))?;
+            .with_context(|| format!("could not start shell {shell:?}"))?;
         let process_id = child.process_id();
 
         let (event_sender, events) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);

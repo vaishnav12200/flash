@@ -17,8 +17,6 @@ use winit::event_loop::EventLoopProxy;
 use crate::event::AppEvent;
 
 pub const ATLAS_SIZE: u32 = 1024;
-pub const DEFAULT_FONT_PATH: &str =
-    "/usr/share/fonts/jetbrains-mono-fonts/JetBrainsMono-Regular.otf";
 pub const DEFAULT_FONT_SIZE: f32 = 18.0;
 const GLYPH_PADDING: u32 = 1;
 const FALLBACK_REQUEST_CAPACITY: usize = 64;
@@ -208,13 +206,8 @@ impl GlyphAtlas {
 
     #[cfg(test)]
     pub fn load_default(scale_factor: f64) -> Result<Self, FontError> {
-        Self::load(
-            Path::new(DEFAULT_FONT_PATH),
-            &[],
-            DEFAULT_FONT_SIZE,
-            scale_factor,
-            None,
-        )
+        let path = default_font_path().expect("a system monospace font must be installed");
+        Self::load(&path, &[], DEFAULT_FONT_SIZE, scale_factor, None)
     }
 
     pub fn glyph(&mut self, character: char) -> Option<GlyphInfo> {
@@ -369,6 +362,42 @@ impl GlyphAtlas {
     }
 }
 
+/// Resolve a usable monospace face without assuming a distribution-specific
+/// package name or filesystem layout. Fontconfig is the normal Linux path;
+/// the explicit candidates keep the default usable on minimal installations
+/// where `fc-match` is unavailable but a common font package is present.
+pub fn default_font_path() -> Option<PathBuf> {
+    let preferred = [
+        "/usr/share/fonts/jetbrains-mono-fonts/JetBrainsMono-Regular.otf",
+        "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf",
+        "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
+    ];
+    if let Some(path) = first_existing_path(preferred) {
+        return Some(path);
+    }
+
+    for pattern in ["JetBrains Mono:spacing=100", "monospace"] {
+        if let Some(path) = fontconfig_paths(pattern).into_iter().next() {
+            return Some(path);
+        }
+    }
+
+    first_existing_path([
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/liberation-mono/LiberationMono-Regular.ttf",
+    ])
+}
+
+fn first_existing_path<const N: usize>(candidates: [&str; N]) -> Option<PathBuf> {
+    candidates
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+}
+
 fn fallback_loader(
     requests: Receiver<char>,
     responses: SyncSender<FallbackResponse>,
@@ -489,20 +518,8 @@ fn load_font(path: &Path) -> Result<Font, FontError> {
 }
 
 fn system_fallback_paths(character: char) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
     let pattern = format!(":charset={:x}", u32::from(character));
-    if let Ok(output) = Command::new("fc-match")
-        .args(["-f", "%{file}\\n", &pattern])
-        .output()
-        && output.status.success()
-    {
-        paths.extend(
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter(|line| !line.is_empty())
-                .map(PathBuf::from),
-        );
-    }
+    let mut paths = fontconfig_paths(&pattern);
     paths.extend([
         PathBuf::from("/usr/share/fonts/google-noto/NotoSansMono-Regular.ttf"),
         PathBuf::from("/usr/share/fonts/google-droid-sans-fonts/DroidSansFallbackFull.ttf"),
@@ -511,6 +528,24 @@ fn system_fallback_paths(character: char) -> Vec<PathBuf> {
     ]);
     paths.retain(|path| path.is_file());
     paths
+}
+
+fn fontconfig_paths(pattern: &str) -> Vec<PathBuf> {
+    let Ok(output) = Command::new("fc-match")
+        .args(["-f", "%{file}\\n", pattern])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .collect()
 }
 
 struct ShelfPacker {
@@ -554,7 +589,11 @@ impl ShelfPacker {
 
 #[cfg(test)]
 mod tests {
-    use super::{ATLAS_SIZE, GlyphAtlas, ShelfPacker};
+    use super::{ATLAS_SIZE, GlyphAtlas, ShelfPacker, default_font_path};
+
+    fn primary_font_path() -> std::path::PathBuf {
+        default_font_path().expect("a system monospace font must be installed")
+    }
 
     fn wait_for_fallbacks(atlas: &mut GlyphAtlas) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -577,7 +616,7 @@ mod tests {
 
     #[test]
     fn default_atlas_contains_printable_ascii() {
-        let mut atlas = GlyphAtlas::load_default(1.0).expect("JetBrains Mono must be installed");
+        let mut atlas = GlyphAtlas::load_default(1.0).expect("a monospace font must be installed");
         assert_eq!(atlas.pixels.len(), (ATLAS_SIZE * ATLAS_SIZE) as usize);
         assert!(atlas.glyph('A').is_some());
         assert!(atlas.glyph('~').is_some());
@@ -626,7 +665,7 @@ mod tests {
 
     #[test]
     fn negative_glyph_cache_is_bounded() {
-        let mut atlas = GlyphAtlas::load_default(1.0).expect("JetBrains Mono must be installed");
+        let mut atlas = GlyphAtlas::load_default(1.0).expect("a monospace font must be installed");
         for value in 0x10_000..0x10_000 + super::MAX_MISSING_GLYPHS as u32 + 100 {
             atlas.mark_missing(char::from_u32(value).expect("test range contains scalar values"));
         }
@@ -635,8 +674,8 @@ mod tests {
 
     #[test]
     fn scale_factor_changes_physical_cell_metrics() {
-        let normal = GlyphAtlas::load_default(1.0).expect("JetBrains Mono must be installed");
-        let scaled = GlyphAtlas::load_default(2.0).expect("JetBrains Mono must be installed");
+        let normal = GlyphAtlas::load_default(1.0).expect("a monospace font must be installed");
+        let scaled = GlyphAtlas::load_default(2.0).expect("a monospace font must be installed");
         assert!(scaled.cell_width > normal.cell_width);
         assert!(scaled.cell_height > normal.cell_height);
     }
@@ -650,7 +689,7 @@ mod tests {
             return;
         }
         let mut atlas = GlyphAtlas::load(
-            std::path::Path::new(super::DEFAULT_FONT_PATH),
+            &primary_font_path(),
             &[fallback],
             super::DEFAULT_FONT_SIZE,
             1.0,
@@ -680,7 +719,7 @@ mod tests {
             return;
         }
         let mut atlas = GlyphAtlas::load(
-            std::path::Path::new(super::DEFAULT_FONT_PATH),
+            &primary_font_path(),
             &[fallback],
             super::DEFAULT_FONT_SIZE,
             1.0,
@@ -697,7 +736,7 @@ mod tests {
 
     #[test]
     fn measures_first_use_latency_for_mixed_unicode_sample() {
-        let mut atlas = GlyphAtlas::load_default(1.0).expect("JetBrains Mono must be installed");
+        let mut atlas = GlyphAtlas::load_default(1.0).expect("a monospace font must be installed");
         let sample = "café naïve résumé ✓ ✗ → ← ↑ ↓ ★ ♥ λ π ∞ 日本語 中文 한국어 e\u{301} a\u{308} n\u{303} 😀 🚀 ❤️ 👍🏽";
         let total_started_at = std::time::Instant::now();
         for character in sample.chars() {

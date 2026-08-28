@@ -1,0 +1,88 @@
+name: Release candidate
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version without the v prefix
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build portable x86-64 archive
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    container:
+      image: docker.io/library/rust@sha256:4727898c104ecd2e22d780925832502faee9fe4e70581b8572af081370b315a0
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Install release dependencies
+        run: apt-get update && apt-get install -y binutils fontconfig fonts-dejavu-core
+      - name: Select and verify version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "${GITHUB_REF_TYPE:-}" = tag ]; then
+            version=${GITHUB_REF_NAME#v}
+          else
+            version=$INPUT_VERSION
+          fi
+          manifest=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          test "$version" = "$manifest"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Install validation components
+        run: rustup component add clippy rustfmt
+      - name: Validate
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-features
+          cargo build --release --locked
+          git diff --check
+      - name: RustSec audit
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit
+      - name: Check glibc compatibility
+        run: scripts/check-glibc.sh target/release/flash 2.36
+      - name: Package release candidate
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          scripts/package-release.sh "$VERSION" target/release/flash dist
+          cd dist
+          sha256sum --check *.sha256
+      - uses: actions/upload-artifact@v7
+        with:
+          name: flash-v${{ steps.version.outputs.version }}-x86_64-unknown-linux-gnu
+          path: dist/*
+          if-no-files-found: error
+
+  draft-release:
+    name: Create draft GitHub release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: flash-v${{ needs.build.outputs.version }}-x86_64-unknown-linux-gnu
+          path: dist
+      - name: Create draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag --generate-notes --title "Flash $GITHUB_REF_NAME"

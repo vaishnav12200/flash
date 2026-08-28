@@ -2,7 +2,7 @@
 
 > A native, GPU-rendered terminal emulator for Linux, built in Rust with Wayland as the primary platform target.
 
-Flash is an early-stage terminal emulator project focused on **low input latency**, **fast startup**, **low memory overhead**, and **correct terminal behavior**. It will connect a real user shell to a Linux pseudo-terminal (PTY), interpret ANSI/VT output into a terminal grid, and render that grid through a GPU pipeline.
+Flash is an early-stage terminal emulator project focused on **low input latency**, **fast startup**, **bounded memory use**, and **correct terminal behavior**. It connects a real user shell to a Linux pseudo-terminal (PTY), interprets ANSI/VT output into a terminal grid, and renders that grid through a GPU pipeline.
 
 > **Project status: Phases 1–9 implemented and technically audited; visual identity pass complete.** Flash uses a spacious near-black/orange theme and a legacy-green cursor while retaining dirty-row rendering, partial GPU uploads, bounded queues, and event-driven idle behavior. The UI contains no permanent logo or decorative panel, and no later roadmap phase has started.
 
@@ -16,6 +16,62 @@ Flash is an early-stage terminal emulator project focused on **low input latency
 - Compact memory use with bounded scrollback and glyph caches
 - Human-editable TOML configuration following XDG conventions
 - Measurable performance rather than unverified “fast terminal” claims
+
+## Requirements
+
+- x86-64 Linux with glibc 2.36 or newer for the prebuilt v0.1.0 archive
+- A Wayland session (native X11 sessions are not supported)
+- A working Vulkan graphics driver
+- Fontconfig (`fc-match`) and at least one outline monospace font
+- A POSIX-compatible shell such as bash or zsh
+
+Building from source additionally requires Rust 1.88 or newer. Flash resolves
+JetBrains Mono through Fontconfig when available and otherwise accepts the
+system's best monospace match; it does not assume Fedora's font package path.
+
+## Installation
+
+### Prebuilt release archive
+
+After v0.1.0 is published, download both Linux assets from the
+[GitHub release](https://github.com/vaishnav12200/flash/releases/tag/v0.1.0),
+then verify and install them for the current user:
+
+```sh
+sha256sum --check flash-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf flash-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+cd flash-v0.1.0-x86_64-unknown-linux-gnu
+install -Dm755 bin/flash "$HOME/.local/bin/flash"
+install -Dm644 share/applications/flash.desktop \
+  "$HOME/.local/share/applications/flash.desktop"
+```
+
+Ensure `$HOME/.local/bin` is in `PATH`, then start Flash from the application
+launcher or run `flash` inside an existing Wayland session.
+
+### Build from source
+
+```sh
+git clone https://github.com/vaishnav12200/flash.git
+cd flash
+cargo build --release --locked
+install -Dm755 target/release/flash "$HOME/.local/bin/flash"
+install -Dm644 packaging/flash.desktop \
+  "$HOME/.local/share/applications/flash.desktop"
+```
+
+### Uninstall
+
+Remove only the files installed above. Configuration is retained unless you
+explicitly remove it:
+
+```sh
+rm "$HOME/.local/bin/flash"
+rm "$HOME/.local/share/applications/flash.desktop"
+```
+
+The optional configuration directory is `$XDG_CONFIG_HOME/flash` or
+`$HOME/.config/flash` when `XDG_CONFIG_HOME` is unset.
 
 ## Non-goals for v0.1
 
@@ -154,7 +210,6 @@ All fields are optional. The current schema and defaults are:
 
 ```toml
 [font]
-path = "/usr/share/fonts/jetbrains-mono-fonts/JetBrainsMono-Regular.otf"
 fallback = []
 size = 18.0
 
@@ -205,11 +260,24 @@ scroll_page_down = "Shift+PageDown"
 scroll_to_bottom = "Ctrl+Shift+End"
 ```
 
+Omit `font.path` to select a portable Fontconfig monospace default. To pin a
+specific face, set it to an absolute `.ttf` or `.otf` path, for example:
+
+```toml
+[font]
+path = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+```
+
 Colors use `#RRGGBB` sRGB values and are converted to the GPU surface's linear working space, so configured values appear as authored. The legacy `window.foreground` and `window.background` keys remain accepted and override their `[colors]` equivalents. Font size is restricted to `6..=72`, padding is specified in logical pixels and must be non-negative, and scrollback is capped at one million lines. Invalid files produce field-specific diagnostics and Flash safely falls back to defaults for that launch.
 
 Cursor blinking uses `ControlFlow::WaitUntil`: Flash wakes only at a configured visibility transition, rebuilds only the cursor row, and immediately restores the cursor when keyboard input or PTY output arrives. Set `blink = false` for fully static idle behavior. Window opacity remains deliberately unsupported because native Wayland alpha/compositor behavior has not been validated across target desktops. Outer corner treatment remains compositor-managed rather than introducing custom window decorations.
 
 Flash deliberately renders no built-in logo, watermark, system-information panel, or prompt text. Shell prompts and any artwork from programs such as fastfetch remain ordinary PTY output. The warm ANSI palette, configurable spacing, selection treatment, and high-contrast green cursor provide the visual identity without guessing at shell-owned prompt semantics.
+
+Optional, terminal-independent zsh and fastfetch examples live under
+[`contrib/`](contrib/README.md). Flash never installs, sources, or writes those
+files automatically, so personal shell presentation stays separate from the
+terminal emulator.
 
 `font.fallback` is an optional ordered list of font files. Flash tries the configured primary face first, then configured fallback faces, then a character-specific system face reported by Fontconfig. Missing faces are parsed on a bounded background loader instead of the render thread; a replacement glyph is shown until the requested face is ready. Unicode glyphs are rasterized lazily into a bounded texture atlas.
 
@@ -254,6 +322,34 @@ For v0.1, emoji are rendered as monochrome outline glyphs through the same font 
 ## Development Status
 
 Phase 9 adds a repeatable allocation-counting throughput benchmark; instrumented startup, PTY, frame-distribution, and input-to-present measurements; allocation-free CSI parameter extraction; reusable scrollback rows; batched PTY parsing; shared backing storage for large paste chunks; terminal row-damage versions; per-row render caches; sparse instance-buffer writes; and dirty-region glyph-atlas uploads. The Phase 1–9 audit additionally hardened cursor/mode semantics, mouse reporting and selection separation, screen-buffer transitions, PTY shutdown, startup sizing, renderer invalidation, atlas bounds, and runtime diagnostics. The visual-identity pass adds Flash's near-black/orange palette, color-space-correct output, logical padding, configurable cursor geometry/blinking, warm selection colors, and a logo-free minimal surface without modifying the terminal model. Phase 9 and visual identity work are complete; no later phase has started.
+
+## Known limitations
+
+- v0.1.0 is native Wayland-only and ships a prebuilt x86-64 glibc binary.
+- `TERM=xterm-256color` is a compatibility baseline; Flash does not implement
+  every xterm private extension and does not yet ship dedicated terminfo.
+- Existing screen lines are resized without shell-style text reflow.
+- Complex text shaping, discretionary ligatures, and color emoji are not
+  supported. Unsupported glyphs use a replacement character.
+- OSC 52 clipboard writes, clickable hyperlinks, Kitty graphics, and Sixel are
+  intentionally unsupported.
+- Tabs, split panes, configuration UI, and X11 fallback are outside v0.1.0.
+
+## Reporting bugs
+
+Search existing [GitHub issues](https://github.com/vaishnav12200/flash/issues)
+before filing a new one. Include the Flash version, distribution, desktop and
+Wayland compositor, GPU/driver, shell, reproduction steps, and relevant logs
+from `RUST_LOG=flash=debug flash`. For rendering bugs, state whether they also
+occur with the default configuration and include a screenshot only after
+checking it for private shell output. Never post credentials, full shell
+history, or clipboard contents. Report security-sensitive problems through the
+private process in [`SECURITY.md`](SECURITY.md), not a public issue.
+
+## License
+
+Flash is dual-licensed under your choice of the
+[MIT License](LICENSE-MIT) or [Apache License 2.0](LICENSE-APACHE).
 
 ## References
 

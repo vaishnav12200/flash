@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
-use crate::font::{DEFAULT_FONT_PATH, DEFAULT_FONT_SIZE};
+use crate::font::{DEFAULT_FONT_SIZE, default_font_path};
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -28,7 +28,7 @@ pub struct FontConfig {
 impl Default for FontConfig {
     fn default() -> Self {
         Self {
-            path: PathBuf::from(DEFAULT_FONT_PATH),
+            path: default_font_path().unwrap_or_default(),
             fallback: Vec::new(),
             size: DEFAULT_FONT_SIZE,
         }
@@ -196,7 +196,9 @@ impl Config {
         let source = match fs::read_to_string(&path) {
             Ok(source) => source,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
+                let config = Self::default();
+                config.validate().context("invalid default configuration")?;
+                return Ok(config);
             }
             Err(error) => {
                 return Err(error).with_context(|| format!("could not read {}", path.display()));
@@ -215,7 +217,9 @@ impl Config {
             bail!("font.size must be between 6 and 72");
         }
         if self.font.path.as_os_str().is_empty() {
-            bail!("font.path must not be empty");
+            bail!(
+                "no usable monospace font was found; install Fontconfig and a monospace font, or set font.path"
+            );
         }
         if self
             .font
