@@ -25,7 +25,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 unicode-width = "0.1.14"
 vte = "0.15.0"
 wgpu = "0.20"
-winit = { version = "0.30", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen"] }
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "wayland", "wayland-csd-adwaita", "wayland-dlopen"] }
 
 [[bench]]
 name = "terminal_throughput"

@@ -22,6 +22,12 @@ All notable changes to Flash are documented here. The format follows
   repeatable Phase 9 performance workloads.
 - A minimal near-black/orange visual theme with a high-contrast green cursor.
 
+### Changed
+
+- Replaced winit's basic Wayland fallback frame with its dark Adwaita
+  client-side decorations, providing crisp procedural minimize,
+  maximize/restore, and close controls with native scaling and interaction.
+
 ### Security
 
 - Escape-string payloads, queues, scrollback, glyph caches, and paste buffers

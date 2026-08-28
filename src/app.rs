@@ -11,7 +11,7 @@ use winit::{
     event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy},
     keyboard::ModifiersState,
-    window::{Window, WindowId},
+    window::{Theme, Window, WindowId},
 };
 
 use crate::{
@@ -623,7 +623,8 @@ impl ApplicationHandler<AppEvent> for App {
             .with_title(WINDOW_TITLE)
             .with_inner_size(INITIAL_WINDOW_SIZE)
             .with_visible(false)
-            .with_resizable(true);
+            .with_resizable(true)
+            .with_theme(Some(Theme::Dark));
 
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
