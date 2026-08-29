@@ -183,7 +183,7 @@ The first major engineering milestone is a real shell whose parsed terminal stat
 flash/
 ├── Cargo.toml
 ├── README.md
-├── LICENSE
+├── LICENSE-MIT
 ├── benches/
 ├── tests/
 └── src/
@@ -348,8 +348,7 @@ private process in [`SECURITY.md`](SECURITY.md), not a public issue.
 
 ## License
 
-Flash is dual-licensed under your choice of the
-[MIT License](LICENSE-MIT) or [Apache License 2.0](LICENSE-APACHE).
+Flash is licensed under the [MIT License](LICENSE-MIT).
 
 ## References
 

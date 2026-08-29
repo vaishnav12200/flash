@@ -59,4 +59,4 @@ behavior, and regression coverage for any correctness fix.
 - Ensure every validation command above passes without broad warning
   suppressions.
 
-Contributions are accepted under the repository's `MIT OR Apache-2.0` license.
+Contributions are accepted under the repository's MIT license.

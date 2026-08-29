@@ -38,7 +38,6 @@ install -Dm644 "$project_dir/packaging/flash.desktop" \
 install -Dm644 "$project_dir/README.md" "$root/README.md"
 install -Dm644 "$project_dir/CHANGELOG.md" "$root/CHANGELOG.md"
 install -Dm644 "$project_dir/LICENSE-MIT" "$root/LICENSE-MIT"
-install -Dm644 "$project_dir/LICENSE-APACHE" "$root/LICENSE-APACHE"
 install -Dm644 "$project_dir/SECURITY.md" "$root/SECURITY.md"
 cp -R "$project_dir/contrib" "$root/contrib"
 
