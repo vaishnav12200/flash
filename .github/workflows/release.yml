@@ -91,4 +91,4 @@ jobs:
       - name: Create draft
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag --generate-notes --title "Flash $GITHUB_REF_NAME"
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --draft --verify-tag --generate-notes --title "Flash $GITHUB_REF_NAME"
