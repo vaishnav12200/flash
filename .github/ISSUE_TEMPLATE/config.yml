@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and support
+    url: https://github.com/vaishnav12200/flash/discussions
+    about: Ask usage, configuration, and development questions in GitHub Discussions.
+  - name: Security vulnerability
+    url: https://github.com/vaishnav12200/flash/security/policy
+    about: Follow the private reporting process; do not disclose vulnerabilities in a public issue.

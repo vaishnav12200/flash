@@ -1,0 +1,67 @@
+name: Feature request
+description: Propose a focused improvement to Flash
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Flash is a minimal terminal emulator. Please describe the user problem first
+        and keep proposals compatible with the existing architecture and scope.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What limitation or workflow problem would this solve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-behavior
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest useful behavior change.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include workarounds or simpler approaches you considered.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: areas
+    attributes:
+      label: Areas affected
+      description: Select every area that the proposal may affect.
+      multiple: true
+      options:
+        - Terminal compatibility
+        - Rendering
+        - Performance
+        - Configuration
+        - UI or visual behavior
+        - Wayland integration
+        - Input
+        - PTY or process lifecycle
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility and performance considerations
+      description: Note expected terminal semantics, latency, memory, or idle-CPU impact, if any.
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add relevant specifications, terminal behavior references, or mockups.

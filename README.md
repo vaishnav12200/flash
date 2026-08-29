@@ -346,6 +346,18 @@ checking it for private shell output. Never post credentials, full shell
 history, or clipboard contents. Report security-sensitive problems through the
 private process in [`SECURITY.md`](SECURITY.md), not a public issue.
 
+## Contributing
+
+Contributions are welcome. Start with the
+[`CONTRIBUTING.md`](CONTRIBUTING.md) development workflow and follow the
+[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md). Beginner-sized work is tracked with
+the [`good first issue`](https://github.com/vaishnav12200/flash/labels/good%20first%20issue)
+label, while broader tasks needing contributors use
+[`help wanted`](https://github.com/vaishnav12200/flash/labels/help%20wanted).
+Please use the issue forms for reproducible bugs and focused feature requests,
+and use [GitHub Discussions](https://github.com/vaishnav12200/flash/discussions)
+for questions and early design conversations.
+
 ## License
 
 Flash is licensed under the [MIT License](LICENSE-MIT).
