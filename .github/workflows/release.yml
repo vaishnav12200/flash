@@ -26,6 +26,11 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      - name: Verify repository checkout
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git -C "$GITHUB_WORKSPACE" rev-parse --is-inside-work-tree)" = true
+          git -C "$GITHUB_WORKSPACE" rev-parse --verify HEAD
       - name: Install release dependencies
         run: apt-get update && apt-get install -y binutils fontconfig fonts-dejavu-core
       - name: Select and verify version
@@ -49,7 +54,7 @@ jobs:
           cargo clippy --locked --all-targets --all-features -- -D warnings
           cargo test --locked --all-features
           cargo build --release --locked
-          git diff --check
+          git -C "$GITHUB_WORKSPACE" diff --check
       - name: RustSec audit
         run: |
           cargo install cargo-audit --version 0.22.2 --locked
@@ -60,7 +65,8 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          SOURCE_DATE_EPOCH=$(git -C "$GITHUB_WORKSPACE" log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
           scripts/package-release.sh "$VERSION" target/release/flash dist
           cd dist
           sha256sum --check *.sha256
