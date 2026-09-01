@@ -250,6 +250,7 @@ blink_interval = 600 # milliseconds, 100..=2000
 lines = 10000
 
 [keybindings]
+search = "Ctrl+Shift+F"
 copy = "Ctrl+Shift+C"
 paste = "Ctrl+Shift+V"
 increase_font = "Ctrl+Shift+Plus"

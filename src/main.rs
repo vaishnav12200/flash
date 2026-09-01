@@ -5,6 +5,7 @@ mod font;
 mod input;
 mod pty;
 mod renderer;
+mod search;
 mod terminal;
 
 use app::App;

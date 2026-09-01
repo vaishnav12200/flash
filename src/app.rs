@@ -21,6 +21,7 @@ use crate::{
     input,
     pty::{self, InputEnqueueError, PtyDimensions, PtyEvent, PtyInput, PtySession},
     renderer::{RenderError, RenderOutcome, Renderer, RendererSettings},
+    search::{SearchDirection, SearchInputOutcome, SearchMatch, SearchState},
     terminal::{MouseTracking, Terminal, TerminalParser},
 };
 
@@ -66,6 +67,7 @@ pub struct App {
     scale_factor: f64,
     config: Config,
     shortcuts: ShortcutMap,
+    search: SearchState,
     modifiers: ModifiersState,
     clipboard: Option<arboard::Clipboard>,
     cursor_position: PhysicalPosition<f64>,
@@ -222,6 +224,7 @@ impl App {
             logical_font_size: config.font.size,
             config,
             shortcuts,
+            search: SearchState::default(),
             modifiers: ModifiersState::empty(),
             clipboard,
             cursor_position: PhysicalPosition::new(0.0, 0.0),
@@ -282,6 +285,9 @@ impl App {
             return;
         };
         let grid_changed = self.terminal.resize(dimensions.grid);
+        if grid_changed {
+            self.refresh_search_after_terminal_change();
+        }
         if !grid_changed && self.pty_dimensions == Some(dimensions) {
             return;
         }
@@ -360,6 +366,7 @@ impl App {
             let process_started_at = Instant::now();
             self.terminal_parser
                 .process(&mut self.terminal, &self.pty_output_batch);
+            self.refresh_search_after_terminal_change();
             self.restart_cursor_blink();
             if self.terminal.mouse_tracking() == MouseTracking::None {
                 self.reported_mouse_button = None;
@@ -472,7 +479,37 @@ impl App {
             return;
         }
         self.restart_cursor_blink();
-        if let Some(action) = self.shortcuts.action(&event.logical_key, self.modifiers) {
+        let shortcut = self.shortcuts.action(&event.logical_key, self.modifiers);
+        if shortcut == Some(ShortcutAction::Search) {
+            self.handle_shortcut(ShortcutAction::Search);
+            return;
+        }
+        if self.search.is_active() {
+            let outcome =
+                self.search
+                    .handle_key(&event.logical_key, event.text.as_deref(), self.modifiers);
+            let found = match outcome {
+                SearchInputOutcome::QueryChanged => self
+                    .search
+                    .find_next(&self.terminal, SearchDirection::Forward),
+                SearchInputOutcome::Navigate(direction) => {
+                    self.search.find_next(&self.terminal, direction)
+                }
+                SearchInputOutcome::Ignored
+                | SearchInputOutcome::Consumed
+                | SearchInputOutcome::Closed => None,
+            };
+            if let Some(found) = found {
+                self.reveal_search_match(found);
+            }
+            if outcome.needs_redraw()
+                && let Some(window) = self.window()
+            {
+                window.request_redraw();
+            }
+            return;
+        }
+        if let Some(action) = shortcut {
             self.handle_shortcut(action);
             return;
         }
@@ -492,22 +529,67 @@ impl App {
     }
 
     fn handle_shortcut(&mut self, action: ShortcutAction) {
-        match action {
-            ShortcutAction::Copy => self.copy_selection(),
-            ShortcutAction::Paste => self.paste_clipboard(),
+        let needs_redraw = match action {
+            ShortcutAction::Search => {
+                let opened = self.search.open();
+                if opened {
+                    if let Some(found) = self
+                        .search
+                        .find_next(&self.terminal, SearchDirection::Forward)
+                    {
+                        self.reveal_search_match(found);
+                    }
+                }
+                opened
+            }
+            ShortcutAction::Copy => {
+                self.copy_selection();
+                true
+            }
+            ShortcutAction::Paste => {
+                self.paste_clipboard();
+                true
+            }
             ShortcutAction::IncreaseFont => {
-                self.change_font_size((self.logical_font_size + FONT_SIZE_STEP).min(MAX_FONT_SIZE))
+                self.change_font_size((self.logical_font_size + FONT_SIZE_STEP).min(MAX_FONT_SIZE));
+                true
             }
             ShortcutAction::DecreaseFont => {
-                self.change_font_size((self.logical_font_size - FONT_SIZE_STEP).max(MIN_FONT_SIZE))
+                self.change_font_size((self.logical_font_size - FONT_SIZE_STEP).max(MIN_FONT_SIZE));
+                true
             }
-            ShortcutAction::ResetFont => self.change_font_size(self.config.font.size),
-            ShortcutAction::ScrollPageUp => self.terminal.scroll_page_up(),
-            ShortcutAction::ScrollPageDown => self.terminal.scroll_page_down(),
-            ShortcutAction::ScrollToBottom => self.terminal.scroll_to_bottom(),
-        }
-        if let Some(window) = self.window() {
+            ShortcutAction::ResetFont => {
+                self.change_font_size(self.config.font.size);
+                true
+            }
+            ShortcutAction::ScrollPageUp => {
+                self.terminal.scroll_page_up();
+                true
+            }
+            ShortcutAction::ScrollPageDown => {
+                self.terminal.scroll_page_down();
+                true
+            }
+            ShortcutAction::ScrollToBottom => {
+                self.terminal.scroll_to_bottom();
+                true
+            }
+        };
+        if needs_redraw && let Some(window) = self.window() {
             window.request_redraw();
+        }
+    }
+
+    fn reveal_search_match(&mut self, search_match: SearchMatch) {
+        self.terminal.reveal_search_row(search_match.row);
+    }
+
+    fn refresh_search_after_terminal_change(&mut self) {
+        if !self.search.is_active() {
+            return;
+        }
+        if let Some(found) = self.search.refresh_current(&self.terminal) {
+            self.reveal_search_match(found);
         }
     }
 

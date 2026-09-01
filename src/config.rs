@@ -165,6 +165,7 @@ impl Default for ScrollbackConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct KeybindingsConfig {
+    pub search: String,
     pub copy: String,
     pub paste: String,
     pub increase_font: String,
@@ -178,6 +179,7 @@ pub struct KeybindingsConfig {
 impl Default for KeybindingsConfig {
     fn default() -> Self {
         Self {
+            search: "Ctrl+Shift+F".to_owned(),
             copy: "Ctrl+Shift+C".to_owned(),
             paste: "Ctrl+Shift+V".to_owned(),
             increase_font: "Ctrl+Shift+Plus".to_owned(),
@@ -344,6 +346,7 @@ pub(crate) fn srgb_to_linear(component: u8) -> f32 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShortcutAction {
+    Search,
     Copy,
     Paste,
     IncreaseFont,
@@ -359,6 +362,7 @@ pub struct ShortcutMap(Vec<(Shortcut, ShortcutAction)>);
 impl ShortcutMap {
     pub fn from_config(config: &KeybindingsConfig) -> Result<Self> {
         let bindings = [
+            (&config.search, ShortcutAction::Search),
             (&config.copy, ShortcutAction::Copy),
             (&config.paste, ShortcutAction::Paste),
             (&config.increase_font, ShortcutAction::IncreaseFont),
@@ -511,6 +515,7 @@ mod tests {
         assert_eq!(config.window.background.as_deref(), Some("#112233"));
         assert_eq!(config.scrollback.lines, 10_000);
         assert_eq!(config.keybindings.copy, "Ctrl+Shift+C");
+        assert_eq!(config.keybindings.search, "Ctrl+Shift+F");
     }
 
     #[test]
@@ -588,6 +593,18 @@ mod tests {
         assert_eq!(
             shortcuts.action(&Key::Character("c".into()), ctrl_shift),
             Some(ShortcutAction::Copy)
+        );
+    }
+
+    #[test]
+    fn default_search_shortcut_is_configured_without_shadowing_plain_ctrl_f() {
+        let shortcuts = ShortcutMap::from_config(&KeybindingsConfig::default()).unwrap();
+        let ctrl = ModifiersState::CONTROL;
+        let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert_eq!(shortcuts.action(&Key::Character("f".into()), ctrl), None);
+        assert_eq!(
+            shortcuts.action(&Key::Character("f".into()), ctrl_shift),
+            Some(ShortcutAction::Search)
         );
     }
 }
