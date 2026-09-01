@@ -4,7 +4,10 @@
 
 Flash is an early-stage terminal emulator project focused on **low input latency**, **fast startup**, **bounded memory use**, and **correct terminal behavior**. It connects a real user shell to a Linux pseudo-terminal (PTY), interprets ANSI/VT output into a terminal grid, and renders that grid through a GPU pipeline.
 
-> **Project status: Phases 1–9 implemented and technically audited; visual identity pass complete.** Flash uses a spacious near-black/orange theme and a legacy-green cursor while retaining dirty-row rendering, partial GPU uploads, bounded queues, and event-driven idle behavior. The UI contains no permanent logo or decorative panel, and no later roadmap phase has started.
+> **Project status: v0.2.0 release candidate.** The Phase 1–9 terminal core,
+> visual identity, and bounded scrollback search have been implemented and
+> audited. Flash retains dirty-row rendering, sparse GPU uploads, bounded
+> queues, and event-driven idle behavior.
 
 ## Goals
 
@@ -19,7 +22,7 @@ Flash is an early-stage terminal emulator project focused on **low input latency
 
 ## Requirements
 
-- x86-64 Linux with glibc 2.36 or newer for the prebuilt v0.1.0 archive
+- x86-64 Linux with glibc 2.36 or newer for the prebuilt v0.2.0 archive
 - A Wayland session (native X11 sessions are not supported)
 - A working Vulkan graphics driver
 - Fontconfig (`fc-match`) and at least one outline monospace font
@@ -33,14 +36,14 @@ system's best monospace match; it does not assume Fedora's font package path.
 
 ### Prebuilt release archive
 
-After v0.1.0 is published, download both Linux assets from the
-[GitHub release](https://github.com/vaishnav12200/flash/releases/tag/v0.1.0),
+Download both Linux assets from the
+[v0.2.0 GitHub release](https://github.com/vaishnav12200/flash/releases/tag/v0.2.0),
 then verify and install them for the current user:
 
 ```sh
-sha256sum --check flash-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar -xzf flash-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
-cd flash-v0.1.0-x86_64-unknown-linux-gnu
+sha256sum --check flash-v0.2.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf flash-v0.2.0-x86_64-unknown-linux-gnu.tar.gz
+cd flash-v0.2.0-x86_64-unknown-linux-gnu
 install -Dm755 bin/flash "$HOME/.local/bin/flash"
 install -Dm644 share/applications/flash.desktop \
   "$HOME/.local/share/applications/flash.desktop"
@@ -73,7 +76,7 @@ rm "$HOME/.local/share/applications/flash.desktop"
 The optional configuration directory is `$XDG_CONFIG_HOME/flash` or
 `$HOME/.config/flash` when `XDG_CONFIG_HOME` is unset.
 
-## Non-goals for v0.1
+## Non-goals for v0.2
 
 The first release deliberately avoids features that increase UI or protocol complexity before the terminal core is reliable:
 
@@ -82,7 +85,8 @@ The first release deliberately avoids features that increase UI or protocol comp
 - Plugins and a graphical settings interface
 - Image protocols such as Kitty graphics or Sixel
 - X11-specific optimization or tuning beyond a possible later fallback
-- Advanced shell integration, search, ligatures, or daemon/client mode
+- Advanced shell integration, regular-expression/fuzzy search, ligatures, or
+  daemon/client mode
 
 ## Architecture
 
@@ -160,6 +164,14 @@ The minimum viable terminal is complete when it can:
 - Provide bounded scrollback, clipboard copy/paste, TOML configuration, and configurable shortcuts
 - Remain stable under large-output stress tests
 
+## v0.2 Scope
+
+v0.2 adds one focused feature to the established terminal core: exact,
+case-sensitive search across the visible primary screen and bounded scrollback.
+It includes a compact local input field, forward/backward navigation, viewport
+reveal, visible match highlighting, Unicode-safe editing, and event-driven
+time-sliced scanning for unusually large histories.
+
 ## Implementation Roadmap
 
 | Phase | Outcome |
@@ -174,6 +186,7 @@ The minimum viable terminal is complete when it can:
 | 7 — User essentials | Scrollback, selection, clipboard, TOML configuration, shortcuts, and font-size controls. |
 | 8 — Unicode | UTF-8, Unicode cell widths, combining marks, fallback fonts, and wide-cell behavior. |
 | 9 — Performance | Repeatable benchmarks, profiling, allocation reductions, damage tracking, and latency measurement. |
+| v0.2 — Search | Bounded scrollback search, local query editing, match navigation/highlighting, and incremental scanning. |
 
 The first major engineering milestone is a real shell whose parsed terminal state is drawn by Flash’s own GPU renderer. Features after that are incremental extensions of a working terminal emulator.
 
@@ -250,6 +263,7 @@ blink_interval = 600 # milliseconds, 100..=2000
 lines = 10000
 
 [keybindings]
+search = "Ctrl+Shift+F"
 copy = "Ctrl+Shift+C"
 paste = "Ctrl+Shift+V"
 increase_font = "Ctrl+Shift+Plus"
@@ -283,6 +297,39 @@ terminal emulator.
 
 Normal terminal input remains distinct from shortcuts: plain `Ctrl+C` sends the PTY interrupt byte, while `Ctrl+Shift+C` copies a selection. Arrow, navigation, editing, Ctrl-letter, and Alt-modified keys are encoded and sent to the PTY rather than moving Flash’s display cursor directly.
 
+## Scrollback search
+
+Press `Ctrl+Shift+F` to open the compact `Find:` field. Search input is local to
+Flash: it is never written to the PTY and never changes the shell/application
+cursor. Matches are taken from the current primary screen plus its configured
+bounded scrollback. While an alternate-screen application is active, only that
+application's live alternate screen is searched.
+
+| Search action | Default input |
+| --- | --- |
+| Open/focus search | `Ctrl+Shift+F` |
+| Insert at the query caret | Type or `Ctrl+Shift+V` |
+| Copy the complete query | `Ctrl+Shift+C` |
+| Move the query caret | `Left`, `Right`, `Home`, `End` |
+| Edit around the caret | `Backspace`, `Delete` |
+| Next match | `Enter` |
+| Previous match | `Shift+Enter` |
+| Close and return input to the PTY | `Escape` |
+
+Navigation wraps at both ends of the searchable rows. The active match is
+revealed through the existing scrollback viewport; other matches in the visible
+grid receive a secondary highlight. Search does not modify terminal cells,
+selection, mouse modes, application colors, or `Terminal.cursor`.
+
+The query is limited to 4 KiB and edited at valid UTF-8 character boundaries.
+Long queries use a horizontal field viewport that follows the caret. Matching
+is currently exact, case-sensitive, unnormalized, and row-local; regular
+expressions, fuzzy matching, cross-row matches, and case folding are not part
+of v0.2. Caret movement is Unicode-scalar safe rather than fully grapheme-aware,
+so a combining sequence may require more than one keypress to traverse or
+delete. Scans allocate no per-match history list and yield through bounded
+event-loop continuations when a large history cannot be scanned promptly.
+
 ## Compatibility and Security
 
 `TERM` is a compatibility contract. Flash currently uses `xterm-256color` as a pragmatic compatibility baseline for the implemented common VT/xterm subset and identifies itself separately through `TERM_PROGRAM=flash`. A dedicated Flash terminfo entry remains future compatibility work; applications must not assume Flash implements every private xterm extension.
@@ -309,23 +356,47 @@ Flash will track these metrics under documented, repeatable conditions:
 
 Useful Linux tools include `/usr/bin/time -v`, `hyperfine`, `perf`, flamegraph tooling, and `strace`. Comparisons with other terminals will use equivalent window size, font, shell, configuration, and compositor conditions; cold and warm starts will be reported separately.
 
-Set `RUST_LOG=flash=debug` to emit startup, PTY-read-to-UI, parser-batch, PTY-write, font-fallback, dirty-row rebuild, partial atlas upload, partial instance upload, redraw-to-present, and render-submit timings. At info level, Flash reports first-window/renderer/PTY/present milestones, fixed-bucket p50/p95/p99 frame summaries, and one-second PTY-to-present summaries. `FLASH_INPUT_LATENCY_PROBE=1` injects one byte after the first usable frame and reports the resulting input-to-present latency without requiring external input automation. Startup keeps the Wayland window hidden until a content-bearing frame has been presented when shell output arrives promptly, with a one-shot fallback deadline for silent shells. PTY input uses a bounded asynchronous writer queue, sustained output is parsed in bounded time/byte slices that yield to presentation, and fallback fonts are selected and parsed off the render thread. All three workers block while idle rather than polling.
+Set `RUST_LOG=flash=debug` to emit startup, PTY-read-to-UI, parser-batch,
+PTY-write, search-slice, visible-match, font-fallback, dirty-row rebuild, partial
+atlas upload, partial instance upload, redraw-to-present, and render-submit
+timings. At info level, Flash reports first-window/renderer/PTY/present
+milestones, fixed-bucket p50/p95/p99 frame summaries, and one-second
+PTY-to-present summaries. `FLASH_INPUT_LATENCY_PROBE=1` injects one byte after
+the first usable frame and reports the resulting input-to-present latency.
+`FLASH_SEARCH_LATENCY_PROBE=<query>` opens search after that frame and runs the
+specified query for repeatable search timing. These variables are diagnostic
+tools, not persistent configuration. Startup keeps the Wayland window hidden
+until a content-bearing frame has been presented when shell output arrives
+promptly, with a one-shot fallback deadline for silent shells. PTY input uses a
+bounded asynchronous writer queue, sustained output is parsed in bounded
+time/byte slices that yield to presentation, search scans use bounded
+event-driven continuations, and fallback fonts are selected and parsed off the
+render thread. Workers block while idle rather than polling.
 
-The exact Phase 9 benchmark commands, environment, baseline, audit reruns, and results are recorded in [`PERFORMANCE.md`](PERFORMANCE.md). `scripts/phase9-unicode-audit.sh` provides a repeatable Unicode, color, PTY-size, and alternate-screen runtime workload.
+The Phase 9 and v0.2 search benchmark commands, environments, baselines, audit
+reruns, and results are recorded in [`PERFORMANCE.md`](PERFORMANCE.md).
+`scripts/phase9-unicode-audit.sh` and `scripts/phase5-search-audit.sh` provide
+repeatable Unicode, color, PTY-size, alternate-screen, and search workloads.
 
 ## Unicode and Emoji Policy
 
 Terminal layout follows Unicode cell-width rules independently of visual glyph metrics. Wide characters own a leading cell plus a protected continuation cell; combining marks remain attached to their base cell; selection and clipboard extraction skip continuation cells while preserving combining sequences. Split UTF-8 sequences from separate PTY reads are retained and decoded correctly.
 
-For v0.1, emoji are rendered as monochrome outline glyphs through the same font atlas as text. Regional-indicator flags, skin-tone modifiers, keycaps, and zero-width-joiner sequences retain one logical cluster span, but Flash does not render color bitmap/COLR emoji or perform discretionary text ligatures. Unsupported glyphs use a replacement glyph rather than changing terminal layout.
+For v0.2, emoji are rendered as monochrome outline glyphs through the same font atlas as text. Regional-indicator flags, skin-tone modifiers, keycaps, and zero-width-joiner sequences retain one logical cluster span, but Flash does not render color bitmap/COLR emoji or perform discretionary text ligatures. Unsupported glyphs use a replacement glyph rather than changing terminal layout.
 
 ## Development Status
 
-Phase 9 adds a repeatable allocation-counting throughput benchmark; instrumented startup, PTY, frame-distribution, and input-to-present measurements; allocation-free CSI parameter extraction; reusable scrollback rows; batched PTY parsing; shared backing storage for large paste chunks; terminal row-damage versions; per-row render caches; sparse instance-buffer writes; and dirty-region glyph-atlas uploads. The Phase 1–9 audit additionally hardened cursor/mode semantics, mouse reporting and selection separation, screen-buffer transitions, PTY shutdown, startup sizing, renderer invalidation, atlas bounds, and runtime diagnostics. The visual-identity pass adds Flash's near-black/orange palette, color-space-correct output, logical padding, configurable cursor geometry/blinking, warm selection colors, and a logo-free minimal surface without modifying the terminal model. Phase 9 and visual identity work are complete; no later phase has started.
+The v0.2 release candidate adds exact bounded scrollback search on top of the
+audited Phase 1–9 terminal core and visual identity. Search state remains local
+to the application layer, scans terminal rows through a read-only interface,
+retains only the active and visible matches, damages only affected visible
+rows, and time-slices maximum-history scans without a worker, polling loop, or
+unbounded index. The six v0.2 implementation phases are complete and awaiting
+release review.
 
 ## Known limitations
 
-- v0.1.0 is native Wayland-only and ships a prebuilt x86-64 glibc binary.
+- v0.2.0 is native Wayland-only and ships a prebuilt x86-64 glibc binary.
 - `TERM=xterm-256color` is a compatibility baseline; Flash does not implement
   every xterm private extension and does not yet ship dedicated terminfo.
 - Existing screen lines are resized without shell-style text reflow.
@@ -333,7 +404,12 @@ Phase 9 adds a repeatable allocation-counting throughput benchmark; instrumented
   supported. Unsupported glyphs use a replacement character.
 - OSC 52 clipboard writes, clickable hyperlinks, Kitty graphics, and Sixel are
   intentionally unsupported.
-- Tabs, split panes, configuration UI, and X11 fallback are outside v0.1.0.
+- Search is exact, case-sensitive, unnormalized, and row-local. It does not
+  currently provide regular expressions, fuzzy search, case folding, or
+  cross-row matching.
+- Search-query caret movement follows Unicode scalar boundaries, not complete
+  grapheme clusters.
+- Tabs, split panes, configuration UI, and X11 fallback are outside v0.2.0.
 
 ## Reporting bugs
 

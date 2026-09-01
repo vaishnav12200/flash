@@ -183,6 +183,13 @@ pub struct RenderSnapshot<'a> {
     pub row_versions: &'a [u64],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SearchContext {
+    pub alternate_active: bool,
+    pub screen_generation: u64,
+    pub row_origin: u64,
+}
+
 #[derive(Debug, Clone)]
 struct Screen {
     cells: Vec<Cell>,
@@ -269,6 +276,8 @@ pub struct Terminal {
     history: VecDeque<Vec<Cell>>,
     history_wrapped: VecDeque<bool>,
     history_limit: usize,
+    search_row_origin: u64,
+    search_screen_generation: u64,
     viewport_offset: usize,
     viewport_cells: Vec<Cell>,
     viewport_wrapped: Vec<bool>,
@@ -309,6 +318,8 @@ impl Terminal {
             history: VecDeque::new(),
             history_wrapped: VecDeque::new(),
             history_limit: 10_000,
+            search_row_origin: 0,
+            search_screen_generation: 0,
             viewport_offset: 0,
             viewport_cells: vec![Cell::default(); cell_count],
             viewport_wrapped: vec![false; rows],
@@ -365,10 +376,13 @@ impl Terminal {
     pub fn set_scrollback_limit(&mut self, limit: usize) {
         let old_offset = self.viewport_offset;
         self.history_limit = limit;
+        let mut removed = 0;
         while self.history.len() > limit {
             self.history.pop_front();
             self.history_wrapped.pop_front();
+            removed += 1;
         }
+        self.advance_search_row_origin(removed);
         self.viewport_offset = self.viewport_offset.min(self.history.len());
         self.refresh_viewport();
         if self.viewport_offset != old_offset {
@@ -493,6 +507,78 @@ impl Terminal {
 
     pub fn alternate_screen_active(&self) -> bool {
         self.alternate_active
+    }
+
+    pub(crate) fn searchable_row_count(&self) -> usize {
+        if self.alternate_active {
+            self.rows
+        } else {
+            self.history.len() + self.rows
+        }
+    }
+
+    pub(crate) fn search_context(&self) -> SearchContext {
+        SearchContext {
+            alternate_active: self.alternate_active,
+            screen_generation: self.search_screen_generation,
+            row_origin: self.search_row_origin,
+        }
+    }
+
+    pub(crate) fn searchable_visible_rows(&self) -> std::ops::Range<usize> {
+        if self.alternate_active {
+            return 0..self.rows;
+        }
+        let start = self.history.len().saturating_sub(self.viewport_offset);
+        start..(start + self.rows).min(self.searchable_row_count())
+    }
+
+    pub(crate) fn reveal_search_row(&mut self, row: usize) -> bool {
+        if row >= self.searchable_row_count() || self.alternate_active {
+            return false;
+        }
+        let visible = self.searchable_visible_rows();
+        let new_offset = if row < visible.start {
+            self.history.len().saturating_sub(row)
+        } else if row >= visible.end {
+            self.history
+                .len()
+                .saturating_add(self.rows.saturating_sub(1))
+                .saturating_sub(row)
+        } else {
+            self.viewport_offset
+        }
+        .min(self.history.len());
+        if new_offset == self.viewport_offset {
+            return false;
+        }
+        self.viewport_offset = new_offset;
+        self.selection = None;
+        self.selection_active = false;
+        self.refresh_viewport();
+        self.damage_all();
+        true
+    }
+
+    /// Returns an immutable physical row in search order. Primary-screen rows
+    /// begin with the oldest retained history row and end with the live grid;
+    /// the alternate screen exposes only its own live grid.
+    pub(crate) fn searchable_row(&self, row: usize) -> Option<&[Cell]> {
+        if self.alternate_active {
+            let start = row.checked_mul(self.columns)?;
+            return self
+                .alternate
+                .cells
+                .get(start..start.saturating_add(self.columns));
+        }
+        if row < self.history.len() {
+            return self.history.get(row).map(Vec::as_slice);
+        }
+        let screen_row = row.checked_sub(self.history.len())?;
+        let start = screen_row.checked_mul(self.columns)?;
+        self.primary
+            .cells
+            .get(start..start.saturating_add(self.columns))
     }
 
     pub fn title(&self) -> &str {
@@ -810,8 +896,10 @@ impl Terminal {
                 self.damage_all();
             }
             3 if !self.alternate_active => {
+                let removed = self.history.len();
                 self.history.clear();
                 self.history_wrapped.clear();
+                self.advance_search_row_origin(removed);
                 self.viewport_offset = 0;
                 self.selection = None;
                 self.selection_active = false;
@@ -982,6 +1070,7 @@ impl Terminal {
         } else {
             self.alternate_active = false;
         }
+        self.search_screen_generation = self.search_screen_generation.wrapping_add(1);
         self.viewport_offset = 0;
         self.selection = None;
         self.selection_active = false;
@@ -994,11 +1083,13 @@ impl Terminal {
         let history_limit = self.history_limit;
         let next_damage_version = self.next_damage_version;
         let damage_batching = self.damage_batching;
+        let search_screen_generation = self.search_screen_generation.wrapping_add(1);
         *self = Self::new(rows, columns);
         self.history_limit = history_limit;
         self.row_versions.fill(0);
         self.next_damage_version = next_damage_version;
         self.damage_batching = damage_batching;
+        self.search_screen_generation = search_screen_generation;
         self.damage_all();
     }
 
@@ -1049,23 +1140,25 @@ impl Terminal {
         }
         let columns = self.columns;
         if !self.alternate_active && top == 0 && bottom + 1 == self.rows {
-            for row in 0..count {
-                if self.history_limit == 0 {
-                    break;
+            if self.history_limit == 0 {
+                self.advance_search_row_origin(count);
+            } else {
+                for row in 0..count {
+                    let start = row * columns;
+                    let mut line = if self.history.len() >= self.history_limit {
+                        self.history_wrapped.pop_front();
+                        self.advance_search_row_origin(1);
+                        self.history
+                            .pop_front()
+                            .expect("full scrollback has a reusable row")
+                    } else {
+                        Vec::with_capacity(columns)
+                    };
+                    line.clear();
+                    line.extend_from_slice(&self.primary.cells[start..start + columns]);
+                    self.history.push_back(line);
+                    self.history_wrapped.push_back(self.primary.wrapped[row]);
                 }
-                let start = row * columns;
-                let mut line = if self.history.len() >= self.history_limit {
-                    self.history_wrapped.pop_front();
-                    self.history
-                        .pop_front()
-                        .expect("full scrollback has a reusable row")
-                } else {
-                    Vec::with_capacity(columns)
-                };
-                line.clear();
-                line.extend_from_slice(&self.primary.cells[start..start + columns]);
-                self.history.push_back(line);
-                self.history_wrapped.push_back(self.primary.wrapped[row]);
             }
             if self.viewport_offset > 0 {
                 self.viewport_offset = self
@@ -1124,6 +1217,10 @@ impl Terminal {
                 self.viewport_wrapped[row] = self.primary.wrapped[screen_row];
             }
         }
+    }
+
+    fn advance_search_row_origin(&mut self, count: usize) {
+        self.search_row_origin = self.search_row_origin.wrapping_add(count as u64);
     }
 
     fn visible_cells(&self) -> &[Cell] {

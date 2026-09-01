@@ -39,6 +39,10 @@ install -Dm644 "$project_dir/README.md" "$root/README.md"
 install -Dm644 "$project_dir/CHANGELOG.md" "$root/CHANGELOG.md"
 install -Dm644 "$project_dir/LICENSE-MIT" "$root/LICENSE-MIT"
 install -Dm644 "$project_dir/SECURITY.md" "$root/SECURITY.md"
+release_notes="$project_dir/RELEASE_NOTES_v${version}.md"
+if [ -f "$release_notes" ]; then
+    install -Dm644 "$release_notes" "$root/RELEASE_NOTES.md"
+fi
 cp -R "$project_dir/contrib" "$root/contrib"
 
 epoch=${SOURCE_DATE_EPOCH:-0}

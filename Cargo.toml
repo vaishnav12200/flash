@@ -1,6 +1,6 @@
 [package]
 name = "flash"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A GPU-first, Wayland-native terminal emulator for Linux"
@@ -29,6 +29,10 @@ winit = { version = "0.30", default-features = false, features = ["rwh_06", "way
 
 [[bench]]
 name = "terminal_throughput"
+harness = false
+
+[[bench]]
+name = "search_throughput"
 harness = false
 
 [profile.release]

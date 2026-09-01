@@ -6,4 +6,5 @@ pub enum AppEvent {
     FontFallbackReady,
     InitialFrameDeadline,
     RedrawRetry,
+    SearchContinue,
 }

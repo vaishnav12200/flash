@@ -145,6 +145,7 @@ pub struct VisualColors {
     pub background: [f32; 4],
     pub foreground: [f32; 4],
     pub cursor: [f32; 4],
+    pub accent: [f32; 4],
     pub selection_background: [f32; 4],
     pub selection_foreground: [f32; 4],
     pub ansi: [[f32; 4]; 16],
@@ -165,6 +166,7 @@ impl Default for ScrollbackConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct KeybindingsConfig {
+    pub search: String,
     pub copy: String,
     pub paste: String,
     pub increase_font: String,
@@ -178,6 +180,7 @@ pub struct KeybindingsConfig {
 impl Default for KeybindingsConfig {
     fn default() -> Self {
         Self {
+            search: "Ctrl+Shift+F".to_owned(),
             copy: "Ctrl+Shift+C".to_owned(),
             paste: "Ctrl+Shift+V".to_owned(),
             increase_font: "Ctrl+Shift+Plus".to_owned(),
@@ -280,7 +283,6 @@ impl Config {
         for (index, (name, value)) in named.into_iter().enumerate() {
             ansi[index] = parse_color(value).with_context(|| name.to_owned())?;
         }
-        parse_color(&colors.accent).context("colors.accent")?;
         Ok(VisualColors {
             background: parse_color(background).context(if self.window.background.is_some() {
                 "window.background"
@@ -293,6 +295,7 @@ impl Config {
                 "colors.foreground"
             })?,
             cursor: parse_color(&colors.cursor).context("colors.cursor")?,
+            accent: parse_color(&colors.accent).context("colors.accent")?,
             selection_background: parse_color(&colors.selection_background)
                 .context("colors.selection_background")?,
             selection_foreground: parse_color(&colors.selection_foreground)
@@ -344,6 +347,7 @@ pub(crate) fn srgb_to_linear(component: u8) -> f32 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShortcutAction {
+    Search,
     Copy,
     Paste,
     IncreaseFont,
@@ -359,6 +363,7 @@ pub struct ShortcutMap(Vec<(Shortcut, ShortcutAction)>);
 impl ShortcutMap {
     pub fn from_config(config: &KeybindingsConfig) -> Result<Self> {
         let bindings = [
+            (&config.search, ShortcutAction::Search),
             (&config.copy, ShortcutAction::Copy),
             (&config.paste, ShortcutAction::Paste),
             (&config.increase_font, ShortcutAction::IncreaseFont),
@@ -492,7 +497,9 @@ mod tests {
         assert_eq!(config.cursor.style, CursorStyle::Block);
         assert!(config.cursor.blink);
         assert_eq!(config.cursor.blink_interval, 600);
-        assert_eq!(config.visual_colors().unwrap().ansi.len(), 16);
+        let visual_colors = config.visual_colors().unwrap();
+        assert_eq!(visual_colors.accent, parse_color("#FF8A2A").unwrap());
+        assert_eq!(visual_colors.ansi.len(), 16);
     }
 
     #[test]
@@ -511,6 +518,7 @@ mod tests {
         assert_eq!(config.window.background.as_deref(), Some("#112233"));
         assert_eq!(config.scrollback.lines, 10_000);
         assert_eq!(config.keybindings.copy, "Ctrl+Shift+C");
+        assert_eq!(config.keybindings.search, "Ctrl+Shift+F");
     }
 
     #[test]
@@ -588,6 +596,18 @@ mod tests {
         assert_eq!(
             shortcuts.action(&Key::Character("c".into()), ctrl_shift),
             Some(ShortcutAction::Copy)
+        );
+    }
+
+    #[test]
+    fn default_search_shortcut_is_configured_without_shadowing_plain_ctrl_f() {
+        let shortcuts = ShortcutMap::from_config(&KeybindingsConfig::default()).unwrap();
+        let ctrl = ModifiersState::CONTROL;
+        let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert_eq!(shortcuts.action(&Key::Character("f".into()), ctrl), None);
+        assert_eq!(
+            shortcuts.action(&Key::Character("f".into()), ctrl_shift),
+            Some(ShortcutAction::Search)
         );
     }
 }

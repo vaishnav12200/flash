@@ -1,6 +1,7 @@
 use std::{error::Error, fmt, mem, path::PathBuf, sync::Arc};
 
 use bytemuck::{Pod, Zeroable};
+use unicode_width::UnicodeWidthChar;
 use wgpu::util::DeviceExt;
 use winit::{
     dpi::{PhysicalPosition, PhysicalSize},
@@ -12,6 +13,7 @@ use crate::{
     config::{CursorStyle, srgb_to_linear},
     event::AppEvent,
     font::{ATLAS_SIZE, AtlasRegion, FontError, GlyphAtlas},
+    search::{SearchPresentation, VisibleSearchMatch},
     terminal::{Cell, Color, Cursor, GridSize, RenderSnapshot},
 };
 
@@ -25,6 +27,7 @@ pub struct RendererSettings {
     pub foreground: [f32; 4],
     pub background: [f32; 4],
     pub cursor: [f32; 4],
+    pub accent: [f32; 4],
     pub cursor_style: CursorStyle,
     pub selection_background: [f32; 4],
     pub selection_foreground: [f32; 4],
@@ -46,6 +49,7 @@ struct GlyphInstance {
 struct RowInstances {
     backgrounds: Vec<GlyphInstance>,
     selections: Vec<GlyphInstance>,
+    search_highlights: Vec<GlyphInstance>,
     glyphs: Vec<GlyphInstance>,
     cursor: Vec<GlyphInstance>,
 }
@@ -74,6 +78,11 @@ pub struct Renderer {
     staged_instances: Vec<GlyphInstance>,
     row_instances: Vec<RowInstances>,
     row_versions: Vec<u64>,
+    search_row_versions: Vec<u64>,
+    search_ui_instances: Vec<GlyphInstance>,
+    search_query_view_start: usize,
+    cached_search_ui_version: u64,
+    cached_search_active: bool,
     cached_columns: usize,
     cached_cursor_visible: bool,
     surface_configured: bool,
@@ -366,6 +375,11 @@ impl Renderer {
             staged_instances: Vec::with_capacity(instance_capacity),
             row_instances: Vec::new(),
             row_versions: Vec::new(),
+            search_row_versions: Vec::new(),
+            search_ui_instances: Vec::new(),
+            search_query_view_start: 0,
+            cached_search_ui_version: 0,
+            cached_search_active: false,
             cached_columns: 0,
             cached_cursor_visible: false,
             surface_configured: false,
@@ -448,6 +462,9 @@ impl Renderer {
         self.atlas = atlas;
         self.row_instances.clear();
         self.row_versions.clear();
+        self.search_row_versions.clear();
+        self.search_ui_instances.clear();
+        self.search_query_view_start = 0;
     }
 
     pub fn grid_size(&self, size: PhysicalSize<u32>) -> GridSize {
@@ -464,12 +481,16 @@ impl Renderer {
         content_size(size, self.settings.padding_x, self.settings.padding_y)
     }
 
-    pub fn render(&mut self, snapshot: RenderSnapshot<'_>) -> Result<RenderOutcome, RenderError> {
+    pub fn render(
+        &mut self,
+        snapshot: RenderSnapshot<'_>,
+        search: SearchPresentation<'_>,
+    ) -> Result<RenderOutcome, RenderError> {
         if !self.surface_configured {
             return Ok(RenderOutcome::Skipped);
         }
         let fallback_changed = self.atlas.drain_fallbacks() > 0;
-        self.build_instances(snapshot, fallback_changed);
+        self.build_instances(snapshot, search, fallback_changed);
         if let Some(region) = self.atlas.take_dirty_region() {
             self.upload_atlas_region(region);
         }
@@ -521,7 +542,12 @@ impl Renderer {
         Ok(RenderOutcome::Presented)
     }
 
-    fn build_instances(&mut self, snapshot: RenderSnapshot<'_>, force_rebuild: bool) {
+    fn build_instances(
+        &mut self,
+        snapshot: RenderSnapshot<'_>,
+        search: SearchPresentation<'_>,
+        force_rebuild: bool,
+    ) {
         let dimensions_changed = self.row_instances.len() != snapshot.rows
             || self.row_versions.len() != snapshot.rows
             || self.cached_columns != snapshot.columns;
@@ -529,25 +555,38 @@ impl Renderer {
             self.row_instances
                 .resize_with(snapshot.rows, RowInstances::default);
             self.row_versions.resize(snapshot.rows, 0);
+            self.search_row_versions.resize(snapshot.rows, 0);
             self.cached_columns = snapshot.columns;
         }
         let cursor_visibility_changed = self.cached_cursor_visible != snapshot.cursor_visible;
+        let search_ui_changed = force_rebuild
+            || dimensions_changed
+            || self.cached_search_ui_version != search.ui_version
+            || self.cached_search_active != search.active;
 
         let mut dirty_row_count = 0;
         for row in 0..snapshot.rows {
+            let search_row_version = search.row_versions.get(row).copied().unwrap_or(0);
             if force_rebuild
                 || dimensions_changed
                 || self.row_versions[row] != snapshot.row_versions[row]
+                || self.search_row_versions[row] != search_row_version
                 || (cursor_visibility_changed && row == snapshot.cursor.row)
             {
                 let mut instances = mem::take(&mut self.row_instances[row]);
-                self.build_row_instances(snapshot, row, &mut instances);
+                self.build_row_instances(snapshot, search, row, &mut instances);
                 self.row_instances[row] = instances;
                 self.row_versions[row] = snapshot.row_versions[row];
+                self.search_row_versions[row] = search_row_version;
                 dirty_row_count += 1;
             }
         }
-        if dirty_row_count == 0 {
+        if search_ui_changed {
+            self.build_search_ui(snapshot, search);
+            self.cached_search_ui_version = search.ui_version;
+            self.cached_search_active = search.active;
+        }
+        if dirty_row_count == 0 && !search_ui_changed {
             return;
         }
         self.cached_cursor_visible = snapshot.cursor_visible;
@@ -560,22 +599,30 @@ impl Renderer {
             self.staged_instances.extend_from_slice(&row.selections);
         }
         for row in &self.row_instances {
+            self.staged_instances
+                .extend_from_slice(&row.search_highlights);
+        }
+        for row in &self.row_instances {
             self.staged_instances.extend_from_slice(&row.glyphs);
         }
         for row in &self.row_instances {
             self.staged_instances.extend_from_slice(&row.cursor);
         }
+        self.staged_instances
+            .extend_from_slice(&self.search_ui_instances);
         self.upload_changed_instances(dirty_row_count, snapshot.rows);
     }
 
     fn build_row_instances(
         &mut self,
         snapshot: RenderSnapshot<'_>,
+        search: SearchPresentation<'_>,
         row: usize,
         instances: &mut RowInstances,
     ) {
         instances.backgrounds.clear();
         instances.selections.clear();
+        instances.search_highlights.clear();
         instances.glyphs.clear();
         instances.cursor.clear();
         for column in 0..snapshot.columns {
@@ -625,6 +672,29 @@ impl Renderer {
                     });
                 }
             }
+        }
+
+        for search_match in search_matches_for_row(search, row) {
+            let mut color = self.settings.accent;
+            color[3] = if search_match.active { 0.48 } else { 0.22 };
+            instances.search_highlights.push(GlyphInstance {
+                position: [
+                    self.settings.padding_x
+                        + search_match.start_cell as f32 * self.atlas.cell_width,
+                    self.settings.padding_y + row as f32 * self.atlas.cell_height,
+                ],
+                size: [
+                    search_match
+                        .end_cell
+                        .saturating_sub(search_match.start_cell) as f32
+                        * self.atlas.cell_width,
+                    self.atlas.cell_height,
+                ],
+                uv_min: self.atlas.solid_uv_min,
+                uv_max: self.atlas.solid_uv_max,
+                color,
+                style: [0.0; 2],
+            });
         }
 
         if snapshot.cursor_visible && snapshot.cursor.row == row {
@@ -735,6 +805,133 @@ impl Renderer {
         }
     }
 
+    fn build_search_ui(&mut self, snapshot: RenderSnapshot<'_>, search: SearchPresentation<'_>) {
+        let mut instances = mem::take(&mut self.search_ui_instances);
+        instances.clear();
+        if !search.active || snapshot.columns == 0 {
+            self.search_query_view_start = 0;
+            self.search_ui_instances = instances;
+            return;
+        }
+
+        const MAX_FIELD_COLUMNS: usize = 36;
+        const MIN_FIELD_COLUMNS: usize = 12;
+        const LABEL: &str = "Find: ";
+        let max_columns = snapshot.columns.min(MAX_FIELD_COLUMNS);
+        let label_width = if max_columns >= 8 { 6 } else { 0 };
+        let maximum_query_width = max_columns.saturating_sub(label_width + 3);
+        let desired_query_width = display_width(search.query).min(maximum_query_width);
+        let desired_columns = label_width + desired_query_width + 3;
+        let field_columns = desired_columns.clamp(MIN_FIELD_COLUMNS.min(max_columns), max_columns);
+        let query_capacity = field_columns.saturating_sub(label_width + 3);
+        let query_view = query_view(
+            search.query,
+            search.caret,
+            &mut self.search_query_view_start,
+            query_capacity,
+        );
+        let start_column = snapshot.columns.saturating_sub(field_columns);
+        let cell_width = self.atlas.cell_width;
+        let cell_height = self.atlas.cell_height;
+        let x = self.settings.padding_x + start_column as f32 * cell_width;
+        let y = self.settings.padding_y;
+
+        let mut background = self.settings.background;
+        background[3] = 0.97;
+        instances.push(self.solid_instance(
+            [x, y],
+            [field_columns as f32 * cell_width, cell_height],
+            background,
+        ));
+        let mut border = self.settings.accent;
+        border[3] = 0.82;
+        let border_height = (2.0 * self.scale_factor as f32).clamp(1.0, 3.0);
+        instances.push(self.solid_instance(
+            [x, y + cell_height - border_height],
+            [field_columns as f32 * cell_width, border_height],
+            border,
+        ));
+
+        let mut text_column = start_column + 1;
+        if label_width > 0 {
+            self.push_search_text(&mut instances, LABEL, text_column, y, self.settings.accent);
+            text_column += label_width;
+        }
+        self.push_search_text(
+            &mut instances,
+            query_view.text,
+            text_column,
+            y,
+            self.settings.foreground,
+        );
+
+        let cursor_x = self.settings.padding_x
+            + (text_column + query_view.caret_column) as f32 * cell_width
+            + cell_width * 0.12;
+        let cursor_inset = (cell_height * 0.18).max(2.0);
+        let cursor_width = (2.0 * self.scale_factor as f32)
+            .clamp(1.0, 3.0)
+            .min(cell_width);
+        instances.push(self.solid_instance(
+            [cursor_x, y + cursor_inset],
+            [cursor_width, (cell_height - cursor_inset * 2.0).max(1.0)],
+            self.settings.accent,
+        ));
+        self.search_ui_instances = instances;
+    }
+
+    fn push_search_text(
+        &mut self,
+        instances: &mut Vec<GlyphInstance>,
+        text: &str,
+        start_column: usize,
+        y: f32,
+        color: [f32; 4],
+    ) {
+        let mut column = start_column;
+        let mut cluster_column = column;
+        for character in text.chars() {
+            let width = UnicodeWidthChar::width(character).unwrap_or(0).min(2);
+            let occupied_width = width.max(1) as f32 * self.atlas.cell_width;
+            if width > 0 {
+                cluster_column = column;
+            }
+            if let Some(glyph) = self
+                .atlas
+                .glyph(character)
+                .filter(|glyph| glyph.width > 0.0 && glyph.height > 0.0)
+            {
+                let centered_advance = (occupied_width - glyph.advance_width) * 0.5;
+                instances.push(GlyphInstance {
+                    position: [
+                        self.settings.padding_x
+                            + cluster_column as f32 * self.atlas.cell_width
+                            + centered_advance
+                            + glyph.x_offset,
+                        y + glyph.y_offset,
+                    ],
+                    size: [glyph.width, glyph.height],
+                    uv_min: glyph.uv_min,
+                    uv_max: glyph.uv_max,
+                    color,
+                    style: [0.0; 2],
+                });
+            }
+            column += width;
+        }
+    }
+
+    fn solid_instance(&self, position: [f32; 2], size: [f32; 2], color: [f32; 4]) -> GlyphInstance {
+        GlyphInstance {
+            position,
+            size,
+            uv_min: self.atlas.solid_uv_min,
+            uv_max: self.atlas.solid_uv_max,
+            color,
+            style: [0.0; 2],
+        }
+    }
+
     fn upload_changed_instances(&mut self, dirty_rows: usize, total_rows: usize) {
         let reallocated = self.ensure_instance_capacity(self.staged_instances.len());
         let mut uploaded_instance_count = 0;
@@ -801,6 +998,13 @@ impl Renderer {
         tracing::debug!(
             dirty_rows,
             total_rows,
+            search_active = self.cached_search_active,
+            search_ui_instances = self.search_ui_instances.len(),
+            search_highlight_instances = self
+                .row_instances
+                .iter()
+                .map(|row| row.search_highlights.len())
+                .sum::<usize>(),
             instance_count = self.staged_instances.len(),
             uploaded_instance_count,
             write_count,
@@ -886,6 +1090,101 @@ impl Renderer {
         self.queue
             .write_buffer(&self.viewport_buffer, 0, bytemuck::bytes_of(&viewport));
     }
+}
+
+fn search_matches_for_row<'a>(
+    search: SearchPresentation<'a>,
+    row: usize,
+) -> impl Iterator<Item = &'a VisibleSearchMatch> {
+    search
+        .matches
+        .iter()
+        .filter(move |search_match| search_match.row == row)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct QueryView<'a> {
+    text: &'a str,
+    caret_column: usize,
+}
+
+fn query_view<'a>(
+    query: &'a str,
+    caret: usize,
+    view_start: &mut usize,
+    maximum_width: usize,
+) -> QueryView<'a> {
+    let caret = floor_char_boundary(query, caret.min(query.len()));
+    if maximum_width == 0 {
+        *view_start = caret;
+        return QueryView {
+            text: "",
+            caret_column: 0,
+        };
+    }
+
+    let mut start = floor_char_boundary(query, (*view_start).min(caret));
+    while display_width(&query[start..caret]) > maximum_width {
+        start = next_char_boundary(query, start);
+    }
+
+    let mut end = visible_end(query, start, maximum_width);
+    if end == query.len() {
+        while let Some(previous) = previous_char_boundary(query, start) {
+            if display_width(&query[previous..end]) > maximum_width {
+                break;
+            }
+            start = previous;
+        }
+        end = visible_end(query, start, maximum_width);
+    }
+
+    *view_start = start;
+    QueryView {
+        text: &query[start..end],
+        caret_column: display_width(&query[start..caret]),
+    }
+}
+
+fn visible_end(query: &str, start: usize, maximum_width: usize) -> usize {
+    let mut end = start;
+    let mut width = 0;
+    for (relative_index, character) in query[start..].char_indices() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0).min(2);
+        if width + character_width > maximum_width {
+            break;
+        }
+        width += character_width;
+        end = start + relative_index + character.len_utf8();
+    }
+    end
+}
+
+fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|character| UnicodeWidthChar::width(character).unwrap_or(0).min(2))
+        .sum()
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn next_char_boundary(text: &str, index: usize) -> usize {
+    text[index..]
+        .chars()
+        .next()
+        .map_or(text.len(), |character| index + character.len_utf8())
+}
+
+fn previous_char_boundary(text: &str, index: usize) -> Option<usize> {
+    text[..index]
+        .char_indices()
+        .next_back()
+        .map(|(previous, _)| previous)
 }
 
 pub(crate) fn content_size(
@@ -1037,10 +1336,11 @@ fn create_instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffe
 #[cfg(test)]
 mod tests {
     use super::{
-        cursor_geometry, grid_size_for_metrics, resolve_cell_colors, resolve_color,
-        resolve_glyph_foreground, rgba,
+        cursor_geometry, grid_size_for_metrics, query_view, resolve_cell_colors, resolve_color,
+        resolve_glyph_foreground, rgba, search_matches_for_row,
     };
     use crate::config::{Config, CursorStyle};
+    use crate::search::{SearchPresentation, VisibleSearchMatch};
     use crate::terminal::{Color, GridSize, Terminal, TerminalParser};
     use winit::dpi::PhysicalSize;
 
@@ -1144,5 +1444,71 @@ mod tests {
             colors.selection_foreground
         );
         assert_eq!(cell.foreground, Color::Indexed(1));
+    }
+
+    #[test]
+    fn search_renderer_reads_only_matches_for_the_requested_viewport_row() {
+        let matches = [
+            VisibleSearchMatch {
+                row: 0,
+                start_cell: 1,
+                end_cell: 4,
+                active: false,
+            },
+            VisibleSearchMatch {
+                row: 1,
+                start_cell: 2,
+                end_cell: 5,
+                active: true,
+            },
+        ];
+        let presentation = SearchPresentation {
+            active: true,
+            query: "hit",
+            caret: 3,
+            matches: &matches,
+            row_versions: &[1, 1],
+            ui_version: 1,
+        };
+
+        assert_eq!(
+            search_matches_for_row(presentation, 1)
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![matches[1]]
+        );
+    }
+
+    #[test]
+    fn search_field_scrolls_a_unicode_query_to_keep_the_caret_visible() {
+        let query = "hello 世界 café 😀 terminal";
+        let mut start = 0;
+        let at_end = query_view(query, query.len(), &mut start, 10);
+        assert_eq!(at_end.text, " terminal");
+        assert_eq!(at_end.caret_column, 9);
+
+        let home = query_view(query, 0, &mut start, 10);
+        assert!(home.text.starts_with("hello"));
+        assert_eq!(home.caret_column, 0);
+
+        let hidden = query_view(query, query.len(), &mut start, 0);
+        assert_eq!(hidden.text, "");
+        assert_eq!(hidden.caret_column, 0);
+    }
+
+    #[test]
+    fn resizing_search_field_keeps_caret_inside_each_visible_window() {
+        let query = "hello 世界 café 😀 terminal";
+        let caret = "hello 世界 café".len();
+        let mut start = 0;
+
+        for width in [18, 7, 3, 12, 24] {
+            let view = query_view(query, caret, &mut start, width);
+            assert!(view.caret_column <= width);
+            assert!(query.is_char_boundary(start));
+            assert!(view.text.len() <= query.len() - start);
+            assert!(start <= caret);
+            assert!(caret <= start + view.text.len());
+        }
     }
 }
