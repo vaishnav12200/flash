@@ -21,7 +21,7 @@ use crate::{
     input,
     pty::{self, InputEnqueueError, PtyDimensions, PtyEvent, PtyInput, PtySession},
     renderer::{RenderError, RenderOutcome, Renderer, RendererSettings},
-    search::{SearchDirection, SearchInputOutcome, SearchMatch, SearchState},
+    search::{SearchDirection, SearchInputOutcome, SearchMatch, SearchProgress, SearchState},
     terminal::{MouseTracking, Terminal, TerminalParser},
 };
 
@@ -32,6 +32,7 @@ const MIN_FONT_SIZE: f32 = 6.0;
 const MAX_FONT_SIZE: f32 = 72.0;
 const MAX_PENDING_INPUT_BYTES: usize = 8 * 1024 * 1024;
 const INITIAL_FRAME_DEADLINE: Duration = Duration::from_millis(100);
+const SEARCH_SLICE_BUDGET: Duration = Duration::from_millis(2);
 const LATENCY_BUCKET_UPPER_US: [u64; 19] = [
     250,
     500,
@@ -68,6 +69,7 @@ pub struct App {
     config: Config,
     shortcuts: ShortcutMap,
     search: SearchState,
+    search_continue_queued: bool,
     modifiers: ModifiersState,
     clipboard: Option<arboard::Clipboard>,
     cursor_position: PhysicalPosition<f64>,
@@ -82,6 +84,7 @@ pub struct App {
     window_visible: bool,
     initial_frame_deadline_reached: bool,
     input_latency_probe_pending: bool,
+    search_latency_probe: Option<String>,
     surface_timeout_retries: u8,
     title_version: u64,
     cursor_blink_visible: bool,
@@ -225,6 +228,7 @@ impl App {
             config,
             shortcuts,
             search: SearchState::default(),
+            search_continue_queued: false,
             modifiers: ModifiersState::empty(),
             clipboard,
             cursor_position: PhysicalPosition::new(0.0, 0.0),
@@ -239,6 +243,9 @@ impl App {
             initial_frame_deadline_reached: false,
             input_latency_probe_pending: std::env::var_os("FLASH_INPUT_LATENCY_PROBE")
                 .is_some_and(|value| value == "1"),
+            search_latency_probe: std::env::var("FLASH_SEARCH_LATENCY_PROBE")
+                .ok()
+                .filter(|query| !query.is_empty()),
             surface_timeout_retries: 0,
             title_version: 0,
             cursor_blink_visible: true,
@@ -485,27 +492,37 @@ impl App {
             return;
         }
         if self.search.is_active() {
+            match shortcut {
+                Some(ShortcutAction::Copy) => {
+                    self.copy_search_query();
+                    return;
+                }
+                Some(ShortcutAction::Paste) => {
+                    self.paste_search_query();
+                    return;
+                }
+                _ => {}
+            }
             let outcome =
                 self.search
                     .handle_key(&event.logical_key, event.text.as_deref(), self.modifiers);
-            let found = match outcome {
-                SearchInputOutcome::QueryChanged => self
-                    .search
-                    .find_next(&self.terminal, SearchDirection::Forward),
-                SearchInputOutcome::Navigate(direction) => {
-                    self.search.find_next(&self.terminal, direction)
+            match outcome {
+                SearchInputOutcome::QueryChanged => {
+                    self.start_search(SearchDirection::Forward);
                 }
-                SearchInputOutcome::Ignored
-                | SearchInputOutcome::Consumed
-                | SearchInputOutcome::Closed => None,
-            };
-            if let Some(found) = found {
-                self.reveal_search_match(found);
-            }
-            if outcome.needs_redraw()
-                && let Some(window) = self.window()
-            {
-                window.request_redraw();
+                SearchInputOutcome::Navigate(direction) => self.start_search(direction),
+                SearchInputOutcome::CaretMoved => {
+                    if let Some(window) = self.window() {
+                        window.request_redraw();
+                    }
+                }
+                SearchInputOutcome::Closed => {
+                    self.search.refresh_visible_matches(&self.terminal);
+                    if let Some(window) = self.window() {
+                        window.request_redraw();
+                    }
+                }
+                SearchInputOutcome::Ignored | SearchInputOutcome::Consumed => {}
             }
             return;
         }
@@ -533,12 +550,7 @@ impl App {
             ShortcutAction::Search => {
                 let opened = self.search.open();
                 if opened {
-                    if let Some(found) = self
-                        .search
-                        .find_next(&self.terminal, SearchDirection::Forward)
-                    {
-                        self.reveal_search_match(found);
-                    }
+                    self.start_search(SearchDirection::Forward);
                 }
                 opened
             }
@@ -564,14 +576,17 @@ impl App {
             }
             ShortcutAction::ScrollPageUp => {
                 self.terminal.scroll_page_up();
+                self.search.refresh_visible_matches(&self.terminal);
                 true
             }
             ShortcutAction::ScrollPageDown => {
                 self.terminal.scroll_page_down();
+                self.search.refresh_visible_matches(&self.terminal);
                 true
             }
             ShortcutAction::ScrollToBottom => {
                 self.terminal.scroll_to_bottom();
+                self.search.refresh_visible_matches(&self.terminal);
                 true
             }
         };
@@ -584,12 +599,59 @@ impl App {
         self.terminal.reveal_search_row(search_match.row);
     }
 
+    fn start_search(&mut self, direction: SearchDirection) {
+        self.search.begin_search(&self.terminal, direction);
+        self.search.refresh_visible_matches(&self.terminal);
+        if let Some(window) = self.window() {
+            window.request_redraw();
+        }
+        self.continue_search();
+    }
+
+    fn continue_search(&mut self) {
+        match self
+            .search
+            .continue_search(&self.terminal, SEARCH_SLICE_BUDGET)
+        {
+            SearchProgress::Idle => {}
+            SearchProgress::Pending => {
+                if !self.search_continue_queued {
+                    self.search_continue_queued = true;
+                    if self
+                        .event_proxy
+                        .send_event(AppEvent::SearchContinue)
+                        .is_err()
+                    {
+                        self.search_continue_queued = false;
+                    }
+                }
+            }
+            SearchProgress::Complete(found) => {
+                if let Some(found) = found {
+                    self.reveal_search_match(found);
+                }
+                self.search.refresh_visible_matches(&self.terminal);
+                if let Some(window) = self.window() {
+                    window.request_redraw();
+                }
+            }
+        }
+    }
+
     fn refresh_search_after_terminal_change(&mut self) {
         if !self.search.is_active() {
             return;
         }
-        if let Some(found) = self.search.refresh_current(&self.terminal) {
-            self.reveal_search_match(found);
+        let pending_direction = self.search.pending_direction();
+        if let Some(found) = self.search.revalidate_current(&self.terminal) {
+            if let Some(direction) = pending_direction {
+                self.start_search(direction);
+            } else {
+                self.reveal_search_match(found);
+                self.search.refresh_visible_matches(&self.terminal);
+            }
+        } else {
+            self.start_search(pending_direction.unwrap_or(SearchDirection::Forward));
         }
     }
 
@@ -607,6 +669,40 @@ impl App {
         };
         if let Err(error) = clipboard.set_text(text) {
             tracing::error!(%error, "could not copy terminal selection");
+        }
+    }
+
+    fn copy_search_query(&mut self) {
+        if self.search.query().is_empty() {
+            return;
+        }
+        let Some(clipboard) = self.clipboard.as_mut() else {
+            tracing::warn!("cannot copy because the Wayland clipboard is unavailable");
+            return;
+        };
+        if let Err(error) = clipboard.set_text(self.search.query().to_owned()) {
+            tracing::error!(%error, "could not copy search query");
+        }
+    }
+
+    fn paste_search_query(&mut self) {
+        let Some(clipboard) = self.clipboard.as_mut() else {
+            tracing::warn!("cannot paste because the Wayland clipboard is unavailable");
+            return;
+        };
+        let text = match clipboard.get_text() {
+            Ok(text) => text,
+            Err(error) => {
+                tracing::error!(%error, "could not read text from the Wayland clipboard");
+                return;
+            }
+        };
+        if !self.search.insert_text(&text) {
+            return;
+        }
+        self.start_search(SearchDirection::Forward);
+        if let Some(window) = self.window() {
+            window.request_redraw();
         }
     }
 
@@ -746,6 +842,7 @@ impl ApplicationHandler<AppEvent> for App {
             foreground: visual_colors.foreground,
             background: visual_colors.background,
             cursor: visual_colors.cursor,
+            accent: visual_colors.accent,
             cursor_style: self.config.cursor.style,
             selection_background,
             selection_foreground: visual_colors.selection_foreground,
@@ -866,6 +963,10 @@ impl ApplicationHandler<AppEvent> for App {
                 {
                     window.request_redraw();
                 }
+            }
+            AppEvent::SearchContinue => {
+                self.search_continue_queued = false;
+                self.continue_search();
             }
         }
     }
@@ -1039,6 +1140,7 @@ impl ApplicationHandler<AppEvent> for App {
                 };
                 if lines != 0 {
                     self.terminal.scroll_viewport(lines);
+                    self.search.refresh_visible_matches(&self.terminal);
                     self.window()
                         .expect("window was validated above")
                         .request_redraw();
@@ -1049,6 +1151,7 @@ impl ApplicationHandler<AppEvent> for App {
                     return;
                 }
                 let mut snapshot = self.terminal.render_snapshot();
+                let search = self.search.presentation();
                 if self.config.cursor.blink && !self.cursor_blink_visible {
                     snapshot.cursor_visible = false;
                 }
@@ -1057,7 +1160,7 @@ impl ApplicationHandler<AppEvent> for App {
                 };
 
                 let render_started_at = Instant::now();
-                match renderer.render(snapshot) {
+                match renderer.render(snapshot, search) {
                     Ok(RenderOutcome::Presented) => {
                         self.surface_timeout_retries = 0;
                         let presented_at = Instant::now();
@@ -1165,6 +1268,15 @@ impl ApplicationHandler<AppEvent> for App {
                             self.latency.pending_key_to_present_at = Some(Instant::now());
                             tracing::info!("latency.input_probe_started");
                             self.write_pty(vec![b'x']);
+                        }
+                        if let Some(query) = self.search_latency_probe.take() {
+                            self.search.open();
+                            self.search.insert_text(&query);
+                            tracing::info!(
+                                query_bytes = self.search.query().len(),
+                                "search latency probe started"
+                            );
+                            self.start_search(SearchDirection::Forward);
                         }
                     }
                     Ok(RenderOutcome::Reconfigured) => self

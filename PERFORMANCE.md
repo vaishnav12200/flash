@@ -1,4 +1,4 @@
-# Phase 9 performance record
+# Performance record
 
 Measurements were taken on 2026-08-26 under GNOME Wayland with an NVIDIA GeForce RTX 3050 6 GB Laptop GPU, a 960×600 Flash window, JetBrains Mono at 18 px, and the Rust release profile. Results are local measurements rather than cross-machine promises. GPU/driver warm-up makes individual startup samples variable.
 
@@ -112,3 +112,89 @@ The 2026-08-27 visual pass does not add a texture, animation loop, queue, termin
 Under `scripts/visual-audit.sh`, the 684-byte ANSI/style/Unicode workload appeared in the first visible frame. The final logo-free content frame rendered in 0.731 ms and was presented 376.188 ms after process launch on this sample. The `20×16` logical-pixel default padding produced a `23×83` renderer and PTY grid in the 960×600, scale-factor-1 test window. Cursor blink transitions rebuilt 1 of 23 rows: hiding needed no GPU write because the draw count shrank, while showing uploaded only the 2 cursor instances in one write. The renderer's instance count fell from 332 with the discarded mark to 331 for the same visible terminal scene.
 
 The final input probe measured 0.695 ms input-to-present. Steady `yes` intervals consumed approximately 1.34–1.37 MB/s with 0.75–1.0 ms render p95 buckets. A 10.09-second idle run with the event-driven 600 ms cursor blink enabled used 0.09 s user and 0.43 s system CPU in total, including startup, and peaked at 135,020 KiB RSS. The event loop used `WaitUntil` only for blink transitions and returned to `Wait` when blinking was disabled, the window was unfocused, or the application cursor was hidden; no busy polling or continuous frame loop was introduced.
+
+## v0.2 scrollback-search audit
+
+Measurements were taken on 2026-09-01 on the same GNOME Wayland/NVIDIA host.
+Absolute times varied with GPU initialization, CPU frequency, and concurrent
+system load. Allocation counts and bounded-work behavior were stable.
+
+### Repeatable commands
+
+```sh
+cargo bench --locked --bench search_throughput
+
+env RUST_LOG=flash=debug \
+  SHELL="$PWD/scripts/phase5-search-audit.sh" \
+  FLASH_SEARCH_LATENCY_PROBE=history-05000 \
+  timeout 10s target/release/flash
+
+/usr/bin/time -f 'user=%U system=%S cpu=%P elapsed=%e rss_kib=%M' \
+  env RUST_LOG=flash=warn SHELL=/bin/sh \
+  timeout 10s target/release/flash
+```
+
+The headless benchmark scans for an absent query after reusable extraction
+buffers have been warmed. The normal case contains 10,002 searchable 80-column
+rows. The configured one-million-line ceiling uses one-column rows to measure
+row-count cost without constructing a multi-gigabyte terminal grid.
+
+### Measured bottleneck and hardening
+
+Before incremental scanning, a synchronous no-match search averaged 4.886 ms
+for normal history and 34.963 ms for 1,000,002 rows. The latter was long enough
+to block an interactive event-loop turn, so application searches were changed
+to event-driven continuation slices with a 2 ms target and an independent
+16,384-row hard cap. Only one continuation can be queued, and edits, terminal
+changes, and closing search invalidate stale work.
+
+| Search workload | Synchronous baseline | Final `cargo bench` sample | Slices | Hot allocations |
+| --- | ---: | ---: | ---: | ---: |
+| 10,002 rows | 4.886 ms | 5.371 ms | 3 | 0 |
+| 1,000,002 rows | 34.963 ms | 61.814 ms | 62 | 0 |
+
+System-load repeats reached 10.775 ms and 124.765 ms total respectively. The
+benchmark's maximum slice remained at or below 2.010 ms. A combined Wayland
+PTY/search workload produced one 4.437 ms wall-clock scheduling outlier; the
+budget is checked between rows rather than being a real-time scheduling
+guarantee, and the row cap remains in force independently.
+
+The final Wayland workload found `history-05000` after scanning 4,995 rows in
+11.865 ms while 10,050 Unicode-bearing lines were still arriving. Visible-grid
+match derivation took 18–72 µs. A smaller incremental workload rebuilt 1–3 of
+23 terminal rows and retained 12 search-field instances plus only visible
+highlight instances. Adding search did not change terminal cells, cursor state,
+selection, application RGB colors, PTY flow, or atlas behavior.
+
+### Regression observations
+
+| Metric | Phase 9 / visual baseline | v0.2 observation |
+| --- | ---: | ---: |
+| Input-to-present probe | 0.695–1.031 ms | 0.676 ms |
+| Steady `yes` consumption | 1.34–1.45 MB/s | about 1.88 MB/s |
+| Heavy-output render p95 bucket | 0.75–1.0 ms | 0.75–3.0 ms |
+| Startup-to-content | 349.9–376.2 ms representative | 387.864–609.830 ms sampled |
+| Startup RSS | about 135 MiB | 168,360 KiB sampled |
+
+The slower startup samples were dominated by current GPU/driver initialization,
+not search, which starts only after the first useful frame. A 10,000-line
+Unicode workload peaked at 441,084 KiB with search enabled and 441,380 KiB
+without it, which places retained search memory below measurement noise. The
+one-million-row headless search benchmark peaked around 88.5 MiB.
+
+Normal idle and completed-search idle each reported 7% total CPU over a
+10.10-second process lifetime, including startup: 0.24/0.49 seconds versus
+0.22/0.49 seconds user/system. Once a search completes there are no continuation
+events, redraw timers, or polling loops. Unicode fallback continued to use
+partial atlas uploads, and primary/alternate-screen isolation, resize, and
+query-viewport caret visibility passed the regression suite and Wayland audit.
+
+The final v0.2 release-readiness recheck measured 7.082 ms/four slices for
+10,002 rows and 78.401 ms/62 slices for 1,000,002 rows, with a 2.016 ms maximum
+benchmark slice and zero hot allocations. The terminal benchmark measured
+16.3 MiB/s ASCII with history, 20.3 MiB/s without history, 19.6 MiB/s styled
+Unicode, and 118.2 MiB/s control-only; allocation counts remained 50,165 or 40
+for each 40 MiB run. The portable candidate's Wayland workload presented
+content at 440.814 ms, found the 4,995-row-away target while output was active,
+loaded CJK fallback incrementally, restored the primary screen, and exited
+cleanly with its PTY child.

@@ -6,6 +6,36 @@ All notable changes to Flash are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Exact, case-sensitive search across the primary screen and bounded scrollback
+  with `Ctrl+Shift+F`, wrapping next/previous navigation, viewport reveal, and
+  primary/alternate-screen isolation.
+- A compact temporary `Find:` field with active and secondary visible-match
+  highlighting, local clipboard copy/paste, a visible query caret, and a
+  horizontal viewport for long queries.
+- Unicode-safe query insertion, Left/Right/Home/End movement, and
+  Backspace/Delete editing without sending search input to the PTY or changing
+  the terminal cursor.
+- Allocation-counted normal/maximum-history search benchmarks and structured
+  search-slice, visible-match, dirty-row, instance, and upload diagnostics.
+
+### Changed
+
+- Large-history searches now run in event-driven slices with a 2 ms target and
+  16,384-row hard cap instead of blocking one event-loop turn. Continuations,
+  query storage, visible matches, and history remain bounded without polling.
+- Search highlights use the existing row-damage and sparse-upload paths and do
+  not modify application-provided cell contents, attributes, or colors.
+
+### Fixed
+
+- Long search queries keep the editing caret visible and can be navigated back
+  to their beginning instead of being irreversibly clipped from the left.
+- Search query paste, edits during an unfinished scan, terminal output during
+  navigation, resize, history eviction, and alternate-screen transitions now
+  invalidate or rebase derived search state without stale results.
+
 ## [0.1.0] - 2026-08-28
 
 ### Added

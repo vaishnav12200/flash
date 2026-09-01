@@ -145,6 +145,7 @@ pub struct VisualColors {
     pub background: [f32; 4],
     pub foreground: [f32; 4],
     pub cursor: [f32; 4],
+    pub accent: [f32; 4],
     pub selection_background: [f32; 4],
     pub selection_foreground: [f32; 4],
     pub ansi: [[f32; 4]; 16],
@@ -282,7 +283,6 @@ impl Config {
         for (index, (name, value)) in named.into_iter().enumerate() {
             ansi[index] = parse_color(value).with_context(|| name.to_owned())?;
         }
-        parse_color(&colors.accent).context("colors.accent")?;
         Ok(VisualColors {
             background: parse_color(background).context(if self.window.background.is_some() {
                 "window.background"
@@ -295,6 +295,7 @@ impl Config {
                 "colors.foreground"
             })?,
             cursor: parse_color(&colors.cursor).context("colors.cursor")?,
+            accent: parse_color(&colors.accent).context("colors.accent")?,
             selection_background: parse_color(&colors.selection_background)
                 .context("colors.selection_background")?,
             selection_foreground: parse_color(&colors.selection_foreground)
@@ -496,7 +497,9 @@ mod tests {
         assert_eq!(config.cursor.style, CursorStyle::Block);
         assert!(config.cursor.blink);
         assert_eq!(config.cursor.blink_interval, 600);
-        assert_eq!(config.visual_colors().unwrap().ansi.len(), 16);
+        let visual_colors = config.visual_colors().unwrap();
+        assert_eq!(visual_colors.accent, parse_color("#FF8A2A").unwrap());
+        assert_eq!(visual_colors.ansi.len(), 16);
     }
 
     #[test]

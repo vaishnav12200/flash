@@ -110,7 +110,7 @@ Phase 3 implementation record:
 
 ### Phase 4 — Search field and match rendering
 
-Status: **pending**
+Status: **complete**
 
 - Draw a compact, temporary search field without adding permanent chrome.
 - Render active and secondary visible match highlights as derived overlays.
@@ -118,9 +118,45 @@ Status: **pending**
 - Invalidate only rows and small UI regions whose search presentation changed.
 - Remove every search instance cleanly when search closes.
 
+Phase 4 implementation record:
+
+- A compact, temporary `Find:` field is drawn over the top-right of the
+  terminal surface only while search is active. It uses the configured Flash
+  accent and existing glyph atlas without reserving terminal rows or adding
+  permanent chrome.
+- `SearchState` derives and retains only active and secondary matches in the
+  current viewport. The list is bounded by visible grid cells and remains
+  separate from terminal contents, attributes, cursor, and selection state.
+- Active matches use a stronger translucent orange overlay; secondary visible
+  matches use a restrained overlay. Application foreground/background colors,
+  ANSI attributes, and truecolor cell state are not modified.
+- Per-row search presentation versions rebuild only rows whose highlight spans
+  or active-match role changed. The small search-field instance list has an
+  independent UI version and does not force a full-grid rebuild.
+- Viewport scrolling, resize, PTY output, history changes, alternate-screen
+  transitions, query edits, navigation, opening, and closing all refresh the
+  derived presentation at the application boundary.
+- Closing search clears the visible span list, damages previously highlighted
+  rows, and removes the field on the next event-driven redraw; it introduces no
+  polling or animation loop.
+- While the search field is focused, the configured copy shortcut copies the
+  complete local query and the configured paste shortcut inserts clipboard text
+  into that query. Pasted text remains UTF-8 safe, control characters are
+  ignored, the 4 KiB query bound is preserved, and no clipboard input reaches
+  the PTY.
+- The field owns an independent byte-boundary caret with Left/Right, Home/End,
+  Backspace/Delete, and insertion-at-caret behavior. A persistent horizontal
+  query viewport keeps that caret visible across long input and resize without
+  overflowing the compact field. Movement is Unicode-scalar safe; full grapheme
+  cluster stepping is intentionally deferred because v0.2 has no segmentation
+  dependency, so a combining sequence can require more than one keypress.
+- Regression coverage verifies bounded visible spans, active/secondary roles,
+  row-scoped damage, viewport changes, clean close behavior, cell-state
+  immutability, renderer row filtering, and Unicode-safe field truncation.
+
 ### Phase 5 — Performance hardening and runtime audit
 
-Status: **pending**
+Status: **complete**
 
 - Instrument query-to-result time, dirty rows, instance uploads, and memory.
 - Test normal and maximum configured scrollback sizes.
@@ -129,15 +165,101 @@ Status: **pending**
 - Recheck idle CPU, input-to-present latency, PTY throughput, resize, Unicode,
   and alternate-screen behavior.
 
+Phase 5 implementation record (local GNOME Wayland measurements on
+2026-09-01):
+
+- `benches/search_throughput.rs` provides allocation-counted full-scan tests at
+  the normal 10,000-row history and the configured 1,000,000-row ceiling. The
+  ceiling uses one-column rows to isolate row-count cost without requiring a
+  multi-gigabyte terminal grid.
+- Before time slicing, no-match scans averaged 4.886 ms for 10,002 80-column
+  rows and 34.963 ms for 1,000,002 one-column rows, with zero allocations after
+  scratch-buffer warm-up. The maximum case was long enough to justify
+  incremental work.
+- Application searches now preserve the exact forward/backward/wrapping
+  semantics while yielding through `AppEvent::SearchContinue`. Each slice is
+  bounded by 2 ms and 16,384 rows, and a single queued-continuation flag avoids
+  duplicate wakeups. Query edits and terminal changes safely replace stale
+  work; closing search leaves a queued event harmlessly idle.
+- After hardening, the final `cargo bench` sample measured 5.371 ms total across
+  three slices for normal history and 61.814 ms across 62 slices for one million
+  rows. Repeats under lower CPU frequency/system load reached 10.775 ms and
+  124.765 ms respectively, while each benchmark slice remained at or below
+  2.010 ms and performed zero hot-scan allocations. Total maximum-history
+  completion takes slightly longer in exchange for keeping the event loop
+  responsive.
+- Structured debug events now expose synchronous and incremental search time,
+  rows scanned, slice time, visible-match derivation time, search UI instances,
+  highlight instances, dirty rows, and instance uploads. The optional
+  `FLASH_SEARCH_LATENCY_PROBE=<query>` opens one search after the first useful
+  frame for repeatable Wayland measurements.
+- The final 10,000-line Unicode Wayland workload found a 4,995-row-away target
+  in 11.865 ms while output was still arriving; slices normally completed near
+  the 2 ms budget, with one 4.437 ms wall-clock scheduling outlier. The budget
+  is checked between rows and backed by the independent 16,384-row hard cap.
+  Visible-row matching took 18–72 µs. A small incremental workload rebuilt
+  1–3 of 23 rows and retained 12 field instances plus only the currently visible
+  highlight instances.
+- Normal idle and completed-search idle samples were effectively identical:
+  0.24/0.49 s and 0.22/0.49 s user/system CPU over 10.10 seconds. The search
+  continuation stops after completion and adds no polling or frame loop.
+- The ordinary input probe measured 0.676 ms input-to-present. Steady `yes`
+  intervals consumed about 1.88 MB/s with observed render-p95 buckets of
+  0.75–3.0 ms. Parser benchmarks remained 20.2 MiB/s ASCII, 26.8 MiB/s without
+  history, 24.3 MiB/s styled Unicode, and 161.5 MiB/s control-only.
+- Startup-to-content ranged from 387.864 to 609.830 ms across sampled launches
+  on the current driver/system state; the latter launch had PTY output queued
+  while GPU initialization completed. Startup RSS was 168,360 KiB in the
+  measured memory run. The 10,000-line workload had
+  effectively identical peak RSS with search enabled and disabled (441,084 vs
+  441,380 KiB), while the one-million-row headless scan peaked at 88,980 KiB;
+  retained search storage therefore remained bounded and below measurement
+  noise.
+- The existing Unicode/alternate-screen audit still used incremental atlas
+  uploads (36,756-byte initial region followed by 850-, 2,556-, and 900-byte
+  regions). Resize/caret visibility, primary/alternate isolation, and repeated
+  terminal resize remain covered by the automated regression suite.
+
 ### Phase 6 — Documentation and v0.2.0 release readiness
 
-Status: **pending**
+Status: **complete**
 
 - Complete the README shortcut and search documentation.
 - Record measured results in `PERFORMANCE.md`.
 - Update `CHANGELOG.md` under **Unreleased**.
 - Run the complete validation and Wayland acceptance suite.
 - Prepare release notes and artifacts only after all earlier phases pass.
+
+Phase 6 implementation record (2026-09-01):
+
+- `README.md` now documents the complete search interaction, configurable
+  shortcut, clipboard and caret behavior, history/alternate-screen scope,
+  diagnostic probe, bounds, architecture, and current matching limitations.
+- `PERFORMANCE.md` records the synchronous bottleneck, incremental scan design,
+  normal and maximum-history benchmarks, allocations, memory, idle behavior,
+  terminal throughput, input latency, and final release-readiness reruns.
+- `CHANGELOG.md` contains the v0.2 changes under **Unreleased**, and
+  `RELEASE_NOTES_v0.2.0.md` contains user-facing highlights, installation, and
+  limitations. Cargo package metadata is versioned `0.2.0`; no release tag or
+  GitHub release was created.
+- The existing pinned Debian/Rust 1.88 release environment built a stripped
+  x86-64 PIE requiring at most glibc 2.35, within the documented 2.36 ceiling.
+  The deterministic archive and checksum are
+  `flash-v0.2.0-x86_64-unknown-linux-gnu.tar.gz` and its `.sha256` companion;
+  two packaging runs produced SHA-256
+  `7fa46a2f413af69b6e3e2065d4a52d1cae76520c7511dba49c28f0947c6d6608`.
+- Host and pinned-container formatting, warnings-denied Clippy, all 127 tests,
+  locked release builds, repository-context whitespace checks, Cargo metadata,
+  source packaging, archive-content/checksum checks, shell syntax, and workflow
+  YAML syntax passed. RustSec reported no vulnerabilities and two upstream
+  maintenance warnings (`paste` and `ttf-parser`).
+- The portable artifact ran under GNOME Wayland, presented the Unicode workload
+  in its first visible frame, exercised live incremental search plus
+  primary/alternate-screen switching, loaded the CJK fallback with a partial
+  atlas upload, reaped its PTY child, and exited cleanly. Keyboard editing,
+  navigation, close routing, cursor independence, resize, selection, and mouse
+  isolation remain protected by the regression suite and the user's preceding
+  interactive acceptance.
 
 ## User experience
 
