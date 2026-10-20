@@ -8,6 +8,9 @@ All notable changes to Flash are documented here. The format follows
 
 ### Added
 
+- A tested Wayland compatibility matrix with partial Omarchy / Hyprland
+  observations and instructions for adding scoped reports.
+
 - Exact, case-sensitive search across the primary screen and bounded scrollback
   with `Ctrl+Shift+F`, wrapping next/previous navigation, viewport reveal, and
   primary/alternate-screen isolation.

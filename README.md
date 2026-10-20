@@ -332,6 +332,9 @@ event-loop continuations when a large history cannot be scanned promptly.
 
 ## Compatibility and Security
 
+See [tested Wayland compatibility observations](COMPATIBILITY.md) for recorded
+environments, partial results and instructions for adding a verified setup.
+
 `TERM` is a compatibility contract. Flash currently uses `xterm-256color` as a pragmatic compatibility baseline for the implemented common VT/xterm subset and identifies itself separately through `TERM_PROGRAM=flash`. A dedicated Flash terminfo entry remains future compatibility work; applications must not assume Flash implements every private xterm extension.
 
 Terminal output is untrusted input. The implementation will bound string-based escape-sequence payloads, fuzz parser/state transitions, avoid unbounded caches, and handle malformed output without panics. Sensitive protocols—including OSC 52 clipboard requests and hyperlink activation—will be conservative and configurable.
